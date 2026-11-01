@@ -51,7 +51,7 @@ pub fn main() -> ExitCode {
             print_boundary(&done.stats);
             if let Some(last) = &done.stats.last_accepted {
                 println!(
-                    "Done ({} concurrent requests): declared ceiling completed; breakpoint not found.",
+                    "Done ({} concurrent requests): tested ceiling completed; breakpoint not found.",
                     last.phase.total_concurrency
                 );
             }
@@ -72,7 +72,17 @@ pub fn main() -> ExitCode {
             } else {
                 eprintln!("{label}: {}", broken.reason);
             }
-            if !matches!(broken.reason, BreakReason::Acceptance) {
+            if broken.connection_failed() {
+                eprintln!(
+                    "Connection setup failed; this does not establish a client or server capacity limit."
+                );
+            } else if matches!(broken.reason, BreakReason::Acceptance)
+                && !broken.has_capacity_boundary()
+            {
+                eprintln!(
+                    "Initial load rejected; no passing baseline was established."
+                );
+            } else if !broken.has_capacity_boundary() {
                 eprintln!("No server capacity claim for this failure.");
             }
             if matches!(broken.reason, BreakReason::Cancelled) {
@@ -172,13 +182,33 @@ impl Observer for Printer {
             humantime::format_duration(stats.elapsed)
         );
         println!(
-            "  target-established={}/{} timeout={} transport={} status={} body={}",
+            "  target-reached-once={}/{} timeout={} transport={} abandoned={} connect={} connect-timeout={} status={} body={}",
             stats.connections_at_target,
             stats.phase.connections,
             stats.counts.timeout,
             stats.counts.transport,
+            stats.counts.abandoned,
+            stats.counts.connect,
+            stats.counts.connect_timeout,
             stats.counts.status,
             stats.counts.body
+        );
+        println!(
+            "  observed-outstanding-avg={:.2} target-coverage={:.2}% connection-time-at-target={:.2}% active={} drain={}",
+            stats.load.mean_outstanding(),
+            stats.load.target_fraction(stats.phase.total_concurrency) * 100.0,
+            stats.load.connection_target_fraction(stats.phase.connections)
+                * 100.0,
+            humantime::format_duration(stats.load.active_elapsed),
+            humantime::format_duration(stats.drain_elapsed())
+        );
+        println!(
+            "  connect-attempts={} setup-seconds={:.6} write-blocked={} max-send-delay={} max-deadline-lateness={}",
+            stats.load.connect_attempts,
+            stats.load.connect_nanos as f64 / 1e9,
+            stats.load.write_blocked,
+            humantime::format_duration(stats.load.max_send_delay),
+            humantime::format_duration(stats.load.max_deadline_lateness)
         );
     }
 }

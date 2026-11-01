@@ -5,8 +5,8 @@ use tokio::sync::watch;
 
 use crate::worker::{Command, Workers, receive};
 use crate::{
-    Acceptance, BreakReason, Broken, CancellationToken, Counts, Done, Observer,
-    Phase, PhaseStats, Stats, Target,
+    Acceptance, BreakReason, Broken, CancellationToken, Counts, Done,
+    LoadStats, Observer, Phase, PhaseStats, Stats, Target,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +110,13 @@ fn phases(
                 .ok_or(BreakReason::Overflow)?,
             duration: plan.phase_duration,
         };
+        // Bound the event-driven load integral before starting any phase traffic.
+        plan.phase_duration
+            .checked_add(plan.timeout)
+            .ok_or(BreakReason::Overflow)?
+            .as_nanos()
+            .checked_mul(phase.total_concurrency as u128)
+            .ok_or(BreakReason::Overflow)?;
         let (start, waiting) = watch::channel(None);
         let phase_stop = CancellationToken::new();
         let mut readiness = Vec::new();
@@ -146,11 +153,13 @@ fn phases(
         let mut counts = Counts::default();
         let mut at_target = 0;
         let mut failure = None;
+        let mut load = LoadStats::default();
         for reply in replies {
             match receive(reply) {
                 Ok(summary) => {
                     counts.add(summary.counts);
                     at_target += summary.at_target;
+                    load.add(summary.load);
                     if let Some(reason) = summary.failure {
                         failure.get_or_insert(reason);
                     }
@@ -166,6 +175,7 @@ fn phases(
             counts,
             elapsed: began.elapsed(),
             connections_at_target: at_target,
+            load,
             completed: failure.is_none() && !stop.is_cancelled(),
             cancelled: stop.is_cancelled(),
         };
@@ -193,10 +203,7 @@ fn phases(
             return Ok(());
         }
         let next = level.checked_add(plan.pace).ok_or(BreakReason::Overflow)?;
-        if plan.max_concurrency.is_some_and(|max| next > max) {
-            return Ok(());
-        }
-        level = next;
+        level = plan.max_concurrency.map_or(next, |max| next.min(max));
         index = index.checked_add(1).ok_or(BreakReason::Overflow)?;
     }
 }

@@ -2,6 +2,7 @@
 
 mod acceptance;
 mod http1;
+mod load;
 mod report;
 mod run;
 mod worker;
@@ -11,6 +12,7 @@ pub mod cli;
 
 pub use acceptance::Acceptance;
 pub use http1::Target;
+pub use load::LoadStats;
 pub use report::{
     BreakReason, Broken, Counts, Done, Observer, Phase, PhaseStats, Stats,
 };

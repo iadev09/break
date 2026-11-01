@@ -8,7 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::decode::Decoder;
 use super::{Client, Outcome, is_local_resource};
-use crate::{BreakReason, Counts};
+use crate::load::Meter;
+use crate::{BreakReason, Counts, LoadStats};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Window {
@@ -23,6 +24,13 @@ pub(crate) struct Summary {
     pub counts: Counts,
     pub at_target: bool,
     pub failure: Option<BreakReason>,
+    pub load: LoadStats,
+}
+
+#[derive(Clone, Copy)]
+struct Writing {
+    offset: usize,
+    began: Instant,
 }
 
 pub(crate) struct Connection {
@@ -30,7 +38,7 @@ pub(crate) struct Connection {
     decoder: Decoder,
     pending: VecDeque<Instant>,
     buffer: Vec<u8>,
-    writing: Option<usize>,
+    writing: Option<Writing>,
     first_deadline: Option<Instant>,
 }
 
@@ -73,19 +81,26 @@ impl Connection {
     fn abandon(
         &mut self,
         counts: &mut Counts,
+        cause: Outcome,
+        meter: &mut Meter,
     ) {
         let now = Instant::now();
-        for deadline in self.pending.drain(..) {
-            if deadline <= now { Outcome::Timeout } else { Outcome::Transport }
-                .record(counts);
+        retire_attempts(self.pending.drain(..), counts, cause, meter, now);
+        if let Some(writing) = self.writing {
+            meter.stats.max_send_delay = meter
+                .stats
+                .max_send_delay
+                .max(now.duration_since(writing.began));
         }
         self.writing = None;
+        meter.change(0, now);
     }
 
     fn receive(
         &mut self,
         size: usize,
         counts: &mut Counts,
+        meter: &mut Meter,
     ) -> Result<bool, BreakReason> {
         let mut used = 0;
         while used < size {
@@ -98,7 +113,15 @@ impl Connection {
             used += read;
             if let Some(reply) = reply {
                 let deadline = self.pending.pop_front().unwrap();
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                meter.change(
+                    self.pending
+                        .len()
+                        .saturating_sub(usize::from(self.writing.is_some())),
+                    now,
+                );
+                if now >= deadline {
+                    meter.expired(deadline, now);
                     Outcome::Timeout
                 } else {
                     reply.outcome
@@ -123,6 +146,7 @@ impl Connection {
         stop: &CancellationToken,
         phase_stop: &CancellationToken,
         summary: &mut Summary,
+        meter: &mut Meter,
     ) -> End {
         if self.pending.try_reserve(window.per_connection).is_err() {
             return End::Failed(BreakReason::Resources(
@@ -133,12 +157,15 @@ impl Connection {
         loop {
             tokio::task::consume_budget().await;
             let now = Instant::now();
-            if self.pending.front().is_some_and(|deadline| *deadline <= now) {
-                self.abandon(&mut summary.counts);
-                return End::Reconnect;
-            }
             let admitting =
                 now < end && !stop.is_cancelled() && !phase_stop.is_cancelled();
+            if !admitting {
+                meter.close_admission(now);
+            }
+            if self.pending.front().is_some_and(|deadline| *deadline <= now) {
+                self.abandon(&mut summary.counts, Outcome::Abandoned, meter);
+                return End::Reconnect;
+            }
             if !admitting && self.pending.is_empty() {
                 return End::Retain;
             }
@@ -159,13 +186,98 @@ impl Connection {
                 _ = tokio::time::sleep_until(deadline.into()) => continue,
                 result = self.stream.ready(interest) => match result {
                     Ok(ready) => ready,
-                    Err(error) => { self.abandon(&mut summary.counts); return End::Failed(error.into()); }
+                    Err(error) => { self.abandon(&mut summary.counts, io_outcome(&error), meter); return End::Failed(error.into()); }
                 },
             };
+            if ready.is_readable() {
+                match self.stream.try_read(&mut self.buffer) {
+                    Ok(0) => {
+                        let mut complete = false;
+                        if let Some(reply) = self.decoder.eof()
+                            && let Some(deadline) = self.pending.pop_front()
+                        {
+                            complete = true;
+                            let now = Instant::now();
+                            meter.change(
+                                self.pending.len().saturating_sub(usize::from(
+                                    self.writing.is_some(),
+                                )),
+                                now,
+                            );
+                            if now >= deadline {
+                                meter.expired(deadline, now);
+                                Outcome::Timeout
+                            } else {
+                                reply.outcome
+                            }
+                            .record(&mut summary.counts);
+                        }
+                        self.abandon(
+                            &mut summary.counts,
+                            if complete {
+                                Outcome::Abandoned
+                            } else {
+                                Outcome::Transport
+                            },
+                            meter,
+                        );
+                        return End::Reconnect;
+                    }
+                    Ok(size) => {
+                        match self.receive(size, &mut summary.counts, meter) {
+                            Ok(true) => {
+                                self.abandon(
+                                    &mut summary.counts,
+                                    Outcome::Abandoned,
+                                    meter,
+                                );
+                                return End::Reconnect;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                self.abandon(
+                                    &mut summary.counts,
+                                    Outcome::Abandoned,
+                                    meter,
+                                );
+                                return End::Failed(error);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    }
+                    Err(error) => {
+                        self.abandon(
+                            &mut summary.counts,
+                            io_outcome(&error),
+                            meter,
+                        );
+                        return if is_local_resource(&error) {
+                            End::Failed(error.into())
+                        } else {
+                            End::Reconnect
+                        };
+                    }
+                }
+            }
             if ready.is_writable() && can_write {
                 loop {
+                    // Use Tokio's own cooperative quantum, not an invented batch limit.
+                    // Returning to the outer loop services reads before another write burst.
+                    if !tokio::task::coop::has_budget_remaining() {
+                        break;
+                    }
+                    tokio::task::consume_budget().await;
+                    let now = Instant::now();
+                    if self
+                        .pending
+                        .front()
+                        .is_some_and(|deadline| *deadline <= now)
+                    {
+                        break;
+                    }
                     if self.writing.is_none() {
-                        if Instant::now() >= end
+                        if now >= end
                             || stop.is_cancelled()
                             || phase_stop.is_cancelled()
                             || self.pending.len() >= window.per_connection
@@ -175,34 +287,51 @@ impl Connection {
                         let deadline = self
                             .first_deadline
                             .take()
-                            .unwrap_or_else(|| Instant::now() + window.timeout);
+                            .unwrap_or(now + window.timeout);
                         self.pending.push_back(deadline);
-                        self.writing = Some(0);
+                        self.writing = Some(Writing { offset: 0, began: now });
                     }
-                    let offset = self.writing.unwrap();
-                    match self.stream.try_write(&client.request[offset..]) {
+                    let writing = self.writing.unwrap();
+                    match self
+                        .stream
+                        .try_write(&client.request[writing.offset..])
+                    {
                         Ok(0) => {
-                            self.abandon(&mut summary.counts);
+                            self.abandon(
+                                &mut summary.counts,
+                                Outcome::Transport,
+                                meter,
+                            );
                             return End::Reconnect;
                         }
                         Ok(written) => {
-                            let next = offset + written;
+                            let next = writing.offset + written;
                             if next == client.request.len() {
                                 self.writing = None;
                                 summary.counts.sent += 1;
-                                summary.at_target |=
-                                    self.pending.len() == window.per_connection;
+                                let now = Instant::now();
+                                meter.stats.max_send_delay = meter
+                                    .stats
+                                    .max_send_delay
+                                    .max(now.duration_since(writing.began));
+                                meter.change(self.pending.len(), now);
                             } else {
-                                self.writing = Some(next);
+                                self.writing =
+                                    Some(Writing { offset: next, ..writing });
                             }
                         }
                         Err(error)
                             if error.kind() == io::ErrorKind::WouldBlock =>
                         {
+                            meter.stats.write_blocked += 1;
                             break;
                         }
                         Err(error) => {
-                            self.abandon(&mut summary.counts);
+                            self.abandon(
+                                &mut summary.counts,
+                                io_outcome(&error),
+                                meter,
+                            );
                             return if is_local_resource(&error) {
                                 End::Failed(error.into())
                             } else {
@@ -212,46 +341,34 @@ impl Connection {
                     }
                 }
             }
-            if ready.is_readable() {
-                match self.stream.try_read(&mut self.buffer) {
-                    Ok(0) => {
-                        if let Some(reply) = self.decoder.eof()
-                            && let Some(deadline) = self.pending.pop_front()
-                        {
-                            if Instant::now() >= deadline {
-                                Outcome::Timeout
-                            } else {
-                                reply.outcome
-                            }
-                            .record(&mut summary.counts);
-                        }
-                        self.abandon(&mut summary.counts);
-                        return End::Reconnect;
-                    }
-                    Ok(size) => match self.receive(size, &mut summary.counts) {
-                        Ok(true) => {
-                            self.abandon(&mut summary.counts);
-                            return End::Reconnect;
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            self.abandon(&mut summary.counts);
-                            return End::Failed(error);
-                        }
-                    },
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    }
-                    Err(error) => {
-                        self.abandon(&mut summary.counts);
-                        return if is_local_resource(&error) {
-                            End::Failed(error.into())
-                        } else {
-                            End::Reconnect
-                        };
-                    }
-                }
-            }
         }
+    }
+}
+
+fn io_outcome(error: &io::Error) -> Outcome {
+    if is_local_resource(error) {
+        Outcome::Abandoned
+    } else {
+        Outcome::Transport
+    }
+}
+
+fn retire_attempts(
+    deadlines: impl Iterator<Item = Instant>,
+    counts: &mut Counts,
+    cause: Outcome,
+    meter: &mut Meter,
+    now: Instant,
+) {
+    let mut direct = Some(cause);
+    for deadline in deadlines {
+        let outcome = if deadline <= now {
+            meter.expired(deadline, now);
+            Outcome::Timeout
+        } else {
+            direct.take().unwrap_or(Outcome::Abandoned)
+        };
+        outcome.record(counts);
     }
 }
 
@@ -264,6 +381,8 @@ pub(crate) async fn run_slot(
     phase_stop: &CancellationToken,
 ) -> (Option<Connection>, Summary) {
     let mut summary = Summary::default();
+    let mut meter =
+        Meter::new(window.start, window.duration, window.per_connection);
     loop {
         if connection.is_none() {
             if Instant::now() >= window.start + window.duration
@@ -272,9 +391,24 @@ pub(crate) async fn run_slot(
             {
                 break;
             }
-            match Connection::connect(client, window.timeout, stop).await {
+            let began = Instant::now();
+            let connected =
+                Connection::connect(client, window.timeout, stop).await;
+            meter.stats.connect_attempts += 1;
+            meter.stats.connect_nanos += began.elapsed().as_nanos();
+            match connected {
                 Ok(opened) => connection = Some(opened),
                 Err(error) => {
+                    if let BreakReason::Io(error) = &error
+                        && !is_local_resource(error)
+                    {
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            Outcome::ConnectTimeout
+                        } else {
+                            Outcome::Connect
+                        }
+                        .record(&mut summary.counts);
+                    }
                     phase_stop.cancel();
                     summary.failure = Some(error);
                     break;
@@ -284,7 +418,14 @@ pub(crate) async fn run_slot(
         match connection
             .as_mut()
             .unwrap()
-            .exchange(client, window, stop, phase_stop, &mut summary)
+            .exchange(
+                client,
+                window,
+                stop,
+                phase_stop,
+                &mut summary,
+                &mut meter,
+            )
             .await
         {
             End::Retain => break,
@@ -297,5 +438,54 @@ pub(crate) async fn run_slot(
             }
         }
     }
+    summary.load = meter.finish(Instant::now());
+    summary.at_target = summary.load.latest_first_target.is_some();
     (connection, summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_retirement_separates_expired_attempts_from_unexpired_followers()
+    {
+        let start = Instant::now();
+        let mut meter = Meter::new(start, Duration::from_secs(10), 3);
+        let mut counts = Counts::default();
+        retire_attempts(
+            [1, 5, 6]
+                .into_iter()
+                .map(|seconds| start + Duration::from_secs(seconds)),
+            &mut counts,
+            Outcome::Abandoned,
+            &mut meter,
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(counts.attempted, 3);
+        assert_eq!(counts.timeout, 1);
+        assert_eq!(counts.abandoned, 2);
+        assert_eq!(counts.transport, 0);
+    }
+
+    #[test]
+    fn a_transport_incident_does_not_become_one_independent_fault_per_pending_request()
+     {
+        let start = Instant::now();
+        let mut meter = Meter::new(start, Duration::from_secs(10), 3);
+        let mut counts = Counts::default();
+        retire_attempts(
+            [5, 6, 7]
+                .into_iter()
+                .map(|seconds| start + Duration::from_secs(seconds)),
+            &mut counts,
+            Outcome::Transport,
+            &mut meter,
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(counts.attempted, 3);
+        assert_eq!(counts.transport, 1);
+        assert_eq!(counts.abandoned, 2);
+        assert_eq!(counts.timeout, 0);
+    }
 }

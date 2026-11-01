@@ -9,6 +9,10 @@
   `BreakReason`, and the `Observer` phase-boundary contract.
 - `src/acceptance.rs`: exact success-ratio comparisons, converted once from the
   plan's decimal percentage. Counts from prior phases cannot mask a rejection.
+- `src/load.rs`: event-driven outstanding-request integrals, connection time at
+  target, setup/send/deadline diagnostics. Owners aggregate once per phase without
+  shared counters, sampling tasks or polling. First attainment is not a claim of
+  sustained or simultaneous global load.
 
 ## Execution
 
@@ -22,6 +26,10 @@
   connection; no per-request task or shared request counter. A response releases
   its slot only after complete-body validation. Socket-read chunks are not payload
   or concurrency limits. Declared phase/deadline timers do not pace requests.
+  Reads and write bursts share Tokio's cooperative budget. Fully sent requests
+  enter the load integral; complete responses or retirement leave it. Expired
+  attempts, direct transport failures and unexpired abandoned followers remain
+  distinct failed outcomes. TCP setup failures are counted separately.
 - `src/http1/decode.rs`: incremental response framing with httparse. Handles
   interim responses, Content-Length, chunked/trailers, close-delimited bodies and
   coalesced/fragmented replies. Payload bytes are checked in place. Ambiguous or
@@ -61,6 +69,9 @@ parallelism. Protocol-specific scheduling does not change the phase contract.
 
 - `src/acceptance.rs`: exact percentage boundaries.
 - `src/run.rs`: plan validation before traffic.
+- `src/load.rs`: observed load versus first attainment, separate owners reaching
+  their targets at different times, and drain/cancellation boundaries.
+- `src/http1/connection.rs`: direct errors versus cascaded abandoned attempts.
 - `src/http1.rs`: URL and client-resource classification.
 - `src/http1/decode.rs`: arbitrary fragmentation, interim/chunked/pipelined
   responses, invalid framing and dynamically sized header fields.

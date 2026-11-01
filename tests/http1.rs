@@ -260,31 +260,42 @@ fn start_and_pace_are_per_connection_and_callbacks_surround_drained_phases() {
     );
     assert_eq!(fixture.connections.load(Ordering::Acquire), 2);
     assert_eq!(broken.stats.last_accepted.unwrap().phase.index, 0);
+    assert!(broken.has_capacity_boundary());
 }
 
 #[test]
 fn real_pipelined_requests_reach_the_limit_without_waiting_for_a_response() {
-    let fixture = Fixture::new(Mode::Fixed, true);
-    let plan = Plan { conn: 3, start: 4, max_concurrency: Some(4), ..plan() };
-    let target = fixture.target();
-    let stop = CancellationToken::new();
-    let cancelling = stop.clone();
-    let client = thread::spawn(move || brk::run(&target, plan, &stop, &mut ()));
-    let all_pending =
-        (0..12).all(|_| fixture.arrivals.recv_timeout(plan.timeout).is_ok());
-    cancelling.cancel();
-    fixture.gate.as_ref().unwrap().release();
-    let broken = client.join().unwrap().unwrap_err();
-    assert!(
-        all_pending,
-        "twelve requests must arrive before any response is released"
-    );
-    assert!(matches!(broken.reason, BreakReason::Cancelled));
-    let phase = broken.stats.last_phase.unwrap();
-    assert_eq!(phase.counts.sent, 12);
-    assert_eq!(phase.counts.successful, 12);
-    assert_eq!(phase.connections_at_target, 3);
-    assert_eq!(fixture.connections.load(Ordering::Acquire), 3);
+    for depth in [4, 256] {
+        let fixture = Fixture::new(Mode::Fixed, true);
+        let plan = Plan {
+            conn: 3,
+            start: depth,
+            max_concurrency: Some(depth),
+            ..plan()
+        };
+        let expected = plan.conn * depth;
+        let target = fixture.target();
+        let stop = CancellationToken::new();
+        let cancelling = stop.clone();
+        let client =
+            thread::spawn(move || brk::run(&target, plan, &stop, &mut ()));
+        let all_pending = (0..expected)
+            .all(|_| fixture.arrivals.recv_timeout(plan.timeout).is_ok());
+        cancelling.cancel();
+        fixture.gate.as_ref().unwrap().release();
+        let broken = client.join().unwrap().unwrap_err();
+        assert!(
+            all_pending,
+            "every pipeline must arrive before any response is released"
+        );
+        assert!(matches!(broken.reason, BreakReason::Cancelled));
+        let phase = broken.stats.last_phase.unwrap();
+        assert_eq!(phase.counts.sent, expected as u64);
+        assert_eq!(phase.counts.successful, expected as u64);
+        assert_eq!(phase.connections_at_target, plan.conn);
+        assert!(phase.load.mean_outstanding() > 0.0);
+        assert_eq!(fixture.connections.load(Ordering::Acquire), plan.conn);
+    }
 }
 
 #[test]
@@ -360,7 +371,10 @@ fn wrong_body_is_a_failed_measured_attempt() {
 
 #[test]
 fn initial_connection_failure_returns_broken_with_paired_callbacks() {
-    let target = Target::new("http://127.0.0.1:0/plain").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let target = Target::new(&format!("http://{address}/plain")).unwrap();
     #[derive(Default)]
     struct Events(Vec<bool>);
     impl Observer for Events {
@@ -394,6 +408,9 @@ fn initial_connection_failure_returns_broken_with_paired_callbacks() {
     assert_eq!(events.0, [true, false]);
     assert!(broken.stats.last_accepted.is_none());
     assert_eq!(broken.stats.total.sent, 0);
+    assert_eq!(broken.stats.total.connect, 1);
+    assert!(broken.connection_failed());
+    assert!(!broken.has_capacity_boundary());
 }
 
 #[test]
@@ -434,6 +451,56 @@ fn increasing_phases_retain_connections_and_stop_at_the_declared_ceiling() {
     assert_eq!(done.stats.last_accepted.unwrap().phase.total_concurrency, 14);
     assert_eq!(fixture.connections.load(Ordering::Acquire), 2);
     assert_eq!(done.stats.total.failed(), 0);
+}
+
+#[test]
+fn a_ceiling_between_pace_levels_is_measured_instead_of_silently_skipped() {
+    let fixture = Fixture::new(Mode::Fixed, false);
+    let plan = Plan { start: 3, pace: 2, max_concurrency: Some(6), ..plan() };
+    let mut observer = Capture {
+        fixture: &fixture,
+        events: Vec::new(),
+        phases: Vec::new(),
+        reject_after_first: false,
+    };
+    let done = brk::run(
+        &fixture.target(),
+        plan,
+        &CancellationToken::new(),
+        &mut observer,
+    )
+    .unwrap();
+    assert_eq!(
+        observer
+            .phases
+            .iter()
+            .map(|phase| phase.phase.requests_per_connection)
+            .collect::<Vec<_>>(),
+        [3, 5, 6]
+    );
+    assert_eq!(done.stats.last_accepted.unwrap().phase.total_concurrency, 12);
+    for stats in observer.phases {
+        assert_eq!(stats.load.active_elapsed, plan.phase_duration);
+        assert!(stats.load.mean_outstanding() > 0.0);
+        assert!(
+            stats.load.target_fraction(stats.phase.total_concurrency) <= 1.0
+        );
+        assert!(stats.load.connection_target_fraction(plan.conn) <= 1.0);
+        assert!(stats.load.latest_first_target.is_some());
+        assert_eq!(stats.counts.attempted, stats.counts.successful);
+    }
+}
+
+#[test]
+fn an_initial_sla_rejection_does_not_establish_a_capacity_boundary() {
+    let fixture = Fixture::new(Mode::Fixed, false);
+    fixture.status.store(503, Ordering::Release);
+    let broken =
+        brk::run(&fixture.target(), plan(), &CancellationToken::new(), &mut ())
+            .unwrap_err();
+    assert!(matches!(broken.reason, BreakReason::Acceptance));
+    assert!(!broken.has_capacity_boundary());
+    assert!(!broken.connection_failed());
 }
 
 #[test]

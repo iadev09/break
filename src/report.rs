@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::Acceptance;
+use crate::{Acceptance, LoadStats};
 
 /// Completed logical attempts, including failures, belonging to one phase.
 #[derive(Clone, Copy, Debug, Default)]
@@ -12,6 +12,11 @@ pub struct Counts {
     pub transport: u64,
     pub status: u64,
     pub body: u64,
+    /// Pending attempts abandoned with a retired connection before their deadline.
+    pub abandoned: u64,
+    /// Failed TCP setup attempts, separate from local resource failures.
+    pub connect: u64,
+    pub connect_timeout: u64,
 }
 
 impl Counts {
@@ -30,6 +35,9 @@ impl Counts {
         self.transport += other.transport;
         self.status += other.status;
         self.body += other.body;
+        self.abandoned += other.abandoned;
+        self.connect += other.connect;
+        self.connect_timeout += other.connect_timeout;
     }
 }
 
@@ -49,14 +57,21 @@ pub struct PhaseStats {
     pub counts: Counts,
     /// Includes drain of all attempts admitted before the phase ended.
     pub elapsed: Duration,
-    /// Connection owners that actually wrote the requested pipeline depth.
+    /// Owners that reached the requested depth at least once during admission.
+    /// This does not assert simultaneous global or sustained attainment.
     pub connections_at_target: usize,
-    /// False when execution was interrupted by a client/protocol failure.
+    pub load: LoadStats,
+    /// False when execution was interrupted by a setup/execution/protocol failure.
     pub completed: bool,
     pub cancelled: bool,
 }
 
 impl PhaseStats {
+    /// Time after admission stopped, including response drain and result collection.
+    pub fn drain_elapsed(&self) -> Duration {
+        self.elapsed.saturating_sub(self.load.active_elapsed)
+    }
+
     pub fn accepted(
         &self,
         acceptance: Acceptance,
@@ -91,7 +106,7 @@ pub struct Done {
 pub enum BreakReason {
     #[error("invalid plan: {0}")]
     Invalid(&'static str),
-    #[error("client I/O: {0}")]
+    #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("client resources: {0}")]
     Resources(&'static str),
@@ -99,7 +114,7 @@ pub enum BreakReason {
     Protocol(&'static str),
     #[error("client worker: {0}")]
     Worker(&'static str),
-    #[error("the client did not establish the declared concurrency")]
+    #[error("the declared concurrency was not established")]
     Unfulfilled,
     #[error("the phase exceeded the HTTP acceptance budget")]
     Acceptance,
@@ -114,6 +129,20 @@ pub enum BreakReason {
 pub struct Broken {
     pub reason: BreakReason,
     pub stats: Box<Stats>,
+}
+
+impl Broken {
+    /// An observed rejection following a passing level, not a confidence interval.
+    pub fn has_capacity_boundary(&self) -> bool {
+        matches!(self.reason, BreakReason::Acceptance)
+            && self.stats.last_accepted.is_some()
+    }
+
+    pub fn connection_failed(&self) -> bool {
+        self.stats.last_phase.is_some_and(|phase| {
+            phase.counts.connect > 0 || phase.counts.connect_timeout > 0
+        })
+    }
 }
 
 /// Runs on the caller at phase boundaries, never on the request path.
@@ -156,6 +185,7 @@ mod tests {
             },
             elapsed: Duration::from_secs(1),
             connections_at_target: 3,
+            load: LoadStats::default(),
             completed: true,
             cancelled: false,
         };

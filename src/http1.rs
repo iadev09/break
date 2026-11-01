@@ -41,7 +41,9 @@ impl Target {
             authority.rsplit_once(':').map(|(_, port)| port)
         };
         if uri.host() == Some("")
-            || port.is_some_and(|port| port.parse::<u16>().is_err())
+            || port.is_some_and(|port| {
+                port.parse::<u16>().map_or(true, |port| port == 0)
+            })
         {
             return Err(BreakReason::Invalid("invalid target host or port"));
         }
@@ -125,6 +127,9 @@ pub(crate) enum Outcome {
     Transport,
     Status,
     Body,
+    Abandoned,
+    Connect,
+    ConnectTimeout,
 }
 
 impl Outcome {
@@ -139,6 +144,9 @@ impl Outcome {
             Self::Transport => counts.transport += 1,
             Self::Status => counts.status += 1,
             Self::Body => counts.body += 1,
+            Self::Abandoned => counts.abandoned += 1,
+            Self::Connect => counts.connect += 1,
+            Self::ConnectTimeout => counts.connect_timeout += 1,
         }
     }
 }
@@ -171,6 +179,7 @@ mod tests {
             "ftp://example.test",
             "http://user:pass@example.test",
             "http://example.test:70000/plain",
+            "http://example.test:0/plain",
             "http://example.test:not-a-port/plain",
             "http://[::1]:70000/plain",
         ] {

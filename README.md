@@ -8,13 +8,13 @@
 
 `break` is an HTTP benchmark that raises concurrent load until observed failures
 exceed your SLA budget. You define the successful-response ratio and timeout;
-`brk` maintains the requested load and evaluates the actual HTTP outcomes in each
+`brk` drives the requested load and evaluates the actual HTTP outcomes in each
 phase, in the environment where you run it.
 
 A successful request is a complete 2xx response within budget. HTTP errors,
 transport failures and timeouts count against that phase. The result shows the
-last load that met your SLA and the first that did not. If the client cannot
-establish the load, it returns an explicit error instead of claiming a server
+last load that met your SLA and the first that did not. If the requested load
+cannot be established, it returns an explicit error instead of claiming a server
 limit. Request rate and resource measurements describe the run; request outcomes
 decide whether it passes.
 
@@ -70,6 +70,38 @@ all server handlers execute simultaneously.
 last tested phase, last accepted phase and counters. Acceptance failure is distinct
 from client I/O/resource failure, invalid protocol data or an unfulfilled target.
 Those client/protocol failures do not establish server capacity.
+
+## Load diagnostics
+
+These diagnostics are available from source; crates.io 0.1.0 does not include them.
+
+Each phase reports its target and observed mean outstanding requests. The mean is
+the time integral of fully written requests awaiting complete responses, divided
+by the active phase time. Setup gaps and connection replacement remain visible;
+drain is excluded from this integral. Successful requests/s still includes drain.
+
+`target-reached-once` records first attainment per connection. It does not prove
+simultaneous global attainment or sustained load. `target-coverage` is the observed
+mean divided by the target. `connection-time-at-target` is the fraction of
+connection time at full pipeline depth. These are observations, not additional
+acceptance thresholds. No undisclosed load tolerance is applied.
+
+Setup attempts/time, blocked writes, maximum send delay and deadline-observation
+lateness expose generator pressure. They do not independently identify server
+time, network time or client scheduling delay. Write bursts share Tokio's
+cooperative budget with reads and the other connection owners.
+
+`timeout`, `transport`, `abandoned`, `connect`, `connect-timeout`, `status` and
+`body` are separate failed-attempt categories. Retiring an ordered connection
+counts unexpired followers as `abandoned`; they still fail acceptance. One socket
+incident is not reported as an independent transport fault for every follower.
+Failed TCP setup counts a logical first-request attempt even though no HTTP
+request was written. Local resource failures remain execution failures.
+
+An initial rejection establishes no passing baseline. A rejection after a passing
+phase brackets this run's observed boundary, at the declared pace resolution.
+The runner does not repeat, refine or claim a confidence interval. An explicit
+`--max` is tested even when it lies between normal pace levels.
 
 ## Library
 
