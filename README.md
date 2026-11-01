@@ -20,6 +20,10 @@ decide whether it passes.
 Package: `break`; command and Rust library: `brk`.
 
 ```sh
+cargo install break
+```
+
+```sh
 brk http://127.0.0.1:8080/api/json \
   --conn 64 --start 2 --pace 2 \
   --phase 10s --timeout 16ms --accept 99.99
