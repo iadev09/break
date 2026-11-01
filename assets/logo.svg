@@ -1,19 +1,19 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" fill="none" role="img" aria-labelledby="title description">
-  <title id="title">break</title>
-  <desc id="description">A blue chain snapped through its middle, with a red fracture and small outward sparks.</desc>
+  <title id="title">brk</title>
+  <desc id="description">A black chain snapped through its middle, with an amber fracture and small outward sparks.</desc>
   <defs>
     <mask id="fracture" maskUnits="userSpaceOnUse" x="0" y="0" width="96" height="96">
       <rect width="96" height="96" fill="white"/>
       <path d="m30 30 14 12-4 6h16l-4 6 14 12" stroke="black" stroke-width="10" stroke-linejoin="round"/>
     </mask>
   </defs>
-  <g mask="url(#fracture)" stroke="#245e7a" stroke-width="4">
+  <g mask="url(#fracture)" stroke="#171717" stroke-width="4">
     <g transform="rotate(-45 48 48)">
       <rect x="10" y="34" width="45" height="28" rx="14"/>
       <rect x="41" y="34" width="45" height="28" rx="14"/>
     </g>
   </g>
-  <g stroke="#e5484d" stroke-linecap="round" stroke-linejoin="round">
+  <g stroke="#f59e0b" stroke-linecap="round" stroke-linejoin="round">
     <path d="m38 37 8 6-5 6h3m8 0h3l-5 6 8 4" stroke-width="3"/>
     <path d="m25 36-6-2m14-8-2-6m40 40 6 2m-14 8 2 6" stroke-width="2.6"/>
   </g>

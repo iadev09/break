@@ -501,7 +501,7 @@ fn cli(fixture: &Fixture) -> std::process::Command {
 
 #[cfg(feature = "cli")]
 #[test]
-fn cli_reports_exit_codes_and_terminal_aware_status_colors() {
+fn cli_reports_exit_codes_and_plain_status_output() {
     let fixture = Fixture::new(Mode::Fixed, false);
     let done = cli(&fixture).env("NO_COLOR", "1").output().unwrap();
     assert_eq!(done.status.code(), Some(0));
@@ -520,22 +520,20 @@ fn cli_reports_exit_codes_and_terminal_aware_status_colors() {
     );
     assert!(!broken.stderr.contains(&0x1b));
 
-    let colored = cli(&fixture)
+    let forced = cli(&fixture)
         .env_remove("NO_COLOR")
         .env("CLICOLOR_FORCE", "1")
         .output()
         .unwrap();
-    assert_eq!(colored.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&colored.stderr)
-            .contains("\x1b[91mBroken\x1b[0m")
-    );
+    assert_eq!(forced.status.code(), Some(1));
+    assert!(!forced.stderr.contains(&0x1b));
 
     let invalid = std::process::Command::new(env!("CARGO_BIN_EXE_brk"))
         .arg("--unknown-option")
         .output()
         .unwrap();
     assert_eq!(invalid.status.code(), Some(2));
+    assert!(!invalid.stderr.contains(&0x1b));
 }
 
 #[cfg(all(feature = "cli", unix))]

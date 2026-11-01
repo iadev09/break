@@ -1,10 +1,9 @@
-<p align="center">
+<h1>
+  <img src="assets/wordmark.svg" width="188" height="96" alt="brk">
   <img src="assets/logo.svg" width="96" height="96" alt="break">
-</p>
+</h1>
 
-# break
-
-**Every server has a breaking point. Find yours.**
+**Finds where contracts are broken**
 
 `break` is an HTTP benchmark that raises concurrent load until observed failures
 exceed your SLA budget. You define the successful-response ratio and timeout;
@@ -34,8 +33,6 @@ Done (256 concurrent requests)
 Broken (384 concurrent requests)
 ```
 
-Status labels are green for `Done`, bright red for `Broken` and yellow for
-`Cancelled`. Colors adapt to the terminal and respect `NO_COLOR`.
 Exit codes: `0` Done, `1` Broken, `2` argument parsing errors, `130` Ctrl-C.
 
 - `--conn`: fixed connection-owner count; closed connections are replaced.

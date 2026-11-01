@@ -21,7 +21,7 @@ required-features = ["cli"]
 
 [features]
 default = ["cli"]
-cli = ["dep:anstream", "dep:clap", "dep:ctrlc", "dep:humantime"]
+cli = ["dep:clap", "dep:ctrlc", "dep:humantime"]
 
 [dependencies]
 # HTTP/1 transport
@@ -36,7 +36,6 @@ tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
 
 # Optional command line
-anstream = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 ctrlc = { version = "3", optional = true }
 humantime = { version = "2", optional = true }

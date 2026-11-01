@@ -6,17 +6,13 @@ use crate::{
     Acceptance, BreakReason, Broken, CancellationToken, Observer, Phase,
     PhaseStats, Plan, Stats, Target,
 };
-use anstream::{eprintln, println};
 use clap::Parser;
-
-const DONE: &str = "\x1b[32mDone\x1b[0m";
-const BROKEN: &str = "\x1b[91mBroken\x1b[0m";
-const CANCELLED: &str = "\x1b[93mCancelled\x1b[0m";
 
 #[derive(Parser)]
 #[command(
     name = "brk",
     version,
+    color = clap::ColorChoice::Never,
     about = env!("CARGO_PKG_DESCRIPTION")
 )]
 struct Args {
@@ -55,7 +51,7 @@ pub fn main() -> ExitCode {
             print_boundary(&done.stats);
             if let Some(last) = &done.stats.last_accepted {
                 println!(
-                    "{DONE} ({} concurrent requests): declared ceiling completed; breakpoint not found.",
+                    "Done ({} concurrent requests): declared ceiling completed; breakpoint not found.",
                     last.phase.total_concurrency
                 );
             }
@@ -64,9 +60,9 @@ pub fn main() -> ExitCode {
         Err(broken) => {
             print_boundary(&broken.stats);
             let label = if matches!(broken.reason, BreakReason::Cancelled) {
-                CANCELLED
+                "Cancelled"
             } else {
-                BROKEN
+                "Broken"
             };
             if let Some(last) = &broken.stats.last_phase {
                 eprintln!(
@@ -149,11 +145,11 @@ impl Observer for Printer {
         stats: &PhaseStats,
     ) {
         let marker = if stats.cancelled {
-            CANCELLED
+            "Cancelled"
         } else if stats.accepted(self.0) {
-            DONE
+            "Done"
         } else {
-            BROKEN
+            "Broken"
         };
         if stats.accepted(self.0) {
             println!(
