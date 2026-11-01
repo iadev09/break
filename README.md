@@ -1,14 +1,42 @@
+<p align="center">
+  <img src="assets/logo.svg" width="96" height="96" alt="break">
+</p>
+
 # break
 
-`brk` raises concurrent HTTP load until a phase breaks the declared success
-ratio or the client cannot establish its target. Package: `break`; library and
-command: `brk`.
+**Every server has a breaking point. Find yours.**
+
+`break` is an HTTP benchmark that raises concurrent load until observed failures
+exceed your SLA budget. You define the successful-response ratio and timeout;
+`brk` maintains the requested load and evaluates the actual HTTP outcomes in each
+phase, in the environment where you run it.
+
+A successful request is a complete 2xx response within budget. HTTP errors,
+transport failures and timeouts count against that phase. The result shows the
+last load that met your SLA and the first that did not. If the client cannot
+establish the load, it returns an explicit error instead of claiming a server
+limit. Request rate and resource measurements describe the run; request outcomes
+decide whether it passes.
+
+Package: `break`; command and Rust library: `brk`.
 
 ```sh
-brk http://127.0.0.1:8080/plain \
-  --conn 4 --start 1 --pace 1 \
-  --phase 10s --timeout 2s --accept 99.99
+brk http://127.0.0.1:8080/api/json \
+  --conn 64 --start 2 --pace 2 \
+  --phase 10s --timeout 16ms --accept 99.99
 ```
+
+Example output:
+
+```text
+Done (128 concurrent requests)
+Done (256 concurrent requests)
+Broken (384 concurrent requests)
+```
+
+Status labels are green for `Done`, bright red for `Broken` and yellow for
+`Cancelled`. Colors adapt to the terminal and respect `NO_COLOR`.
+Exit codes: `0` Done, `1` Broken, `2` argument parsing errors, `130` Ctrl-C.
 
 - `--conn`: fixed connection-owner count; closed connections are replaced.
 - `--start`: initial concurrent requests per connection; defaults to `pace`.
@@ -65,9 +93,9 @@ impl Observer for Measurements {
 
 let target = Target::new("http://127.0.0.1:8080/plain")?;
 let plan = Plan {
-    conn: 4, start: 1, pace: 1,
+    conn: 64, start: 2, pace: 2,
     phase_duration: Duration::from_secs(10),
-    timeout: Duration::from_secs(2),
+    timeout: Duration::from_millis(16),
     accept: 99.99, max_concurrency: Some(8),
 };
 let result = brk::run(&target, plan, &CancellationToken::new(), &mut Measurements);

@@ -6,13 +6,18 @@ use crate::{
     Acceptance, BreakReason, Broken, CancellationToken, Observer, Phase,
     PhaseStats, Plan, Stats, Target,
 };
+use anstream::{eprintln, println};
 use clap::Parser;
+
+const DONE: &str = "\x1b[32mDone\x1b[0m";
+const BROKEN: &str = "\x1b[91mBroken\x1b[0m";
+const CANCELLED: &str = "\x1b[93mCancelled\x1b[0m";
 
 #[derive(Parser)]
 #[command(
     name = "brk",
     version,
-    about = "Find the concurrent HTTP load that breaks an acceptance budget"
+    about = env!("CARGO_PKG_DESCRIPTION")
 )]
 struct Args {
     /// HTTP URL to test.
@@ -48,12 +53,29 @@ pub fn main() -> ExitCode {
     match execute(args) {
         Ok(done) => {
             print_boundary(&done.stats);
-            println!("Done: declared ceiling completed; breakpoint not found.");
+            if let Some(last) = &done.stats.last_accepted {
+                println!(
+                    "{DONE} ({} concurrent requests): declared ceiling completed; breakpoint not found.",
+                    last.phase.total_concurrency
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(broken) => {
             print_boundary(&broken.stats);
-            eprintln!("Broken: {}", broken.reason);
+            let label = if matches!(broken.reason, BreakReason::Cancelled) {
+                CANCELLED
+            } else {
+                BROKEN
+            };
+            if let Some(last) = &broken.stats.last_phase {
+                eprintln!(
+                    "{label} ({} concurrent requests): {}",
+                    last.phase.total_concurrency, broken.reason
+                );
+            } else {
+                eprintln!("{label}: {}", broken.reason);
+            }
             if !matches!(broken.reason, BreakReason::Acceptance) {
                 eprintln!("No server capacity claim for this failure.");
             }
@@ -127,18 +149,25 @@ impl Observer for Printer {
         stats: &PhaseStats,
     ) {
         let marker = if stats.cancelled {
-            "cancelled"
-        } else if !stats.completed {
-            "broken"
-        } else if stats.connections_at_target != stats.phase.connections {
-            "unfulfilled"
+            CANCELLED
         } else if stats.accepted(self.0) {
-            "pass"
+            DONE
         } else {
-            "reject"
+            BROKEN
         };
+        if stats.accepted(self.0) {
+            println!(
+                "  {marker} ({} concurrent requests)",
+                stats.phase.total_concurrency
+            );
+        } else {
+            eprintln!(
+                "  {marker} ({} concurrent requests)",
+                stats.phase.total_concurrency
+            );
+        }
         println!(
-            "  {marker}: sent={} attempts={} successful={} errors={} successful-requests/s={:.2} elapsed={}",
+            "  sent={} attempts={} successful={} errors={} successful-requests/s={:.2} elapsed={}",
             stats.counts.sent,
             stats.counts.attempted,
             stats.counts.successful,

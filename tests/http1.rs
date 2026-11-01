@@ -476,3 +476,86 @@ fn callback_unwinding_releases_gated_workers_without_sending_load() {
     assert!(result.is_err());
     assert_eq!(fixture.requests.load(Ordering::Acquire), 0);
 }
+
+#[cfg(feature = "cli")]
+fn cli(fixture: &Fixture) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_brk"));
+    command.arg(format!("http://{}/plain", fixture.address)).args([
+        "--conn",
+        "1",
+        "--start",
+        "1",
+        "--pace",
+        "1",
+        "--phase",
+        "100ms",
+        "--timeout",
+        "2s",
+        "--max",
+        "1",
+        "--expect-body",
+        "ok",
+    ]);
+    command
+}
+
+#[cfg(feature = "cli")]
+#[test]
+fn cli_reports_exit_codes_and_terminal_aware_status_colors() {
+    let fixture = Fixture::new(Mode::Fixed, false);
+    let done = cli(&fixture).env("NO_COLOR", "1").output().unwrap();
+    assert_eq!(done.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&done.stdout)
+            .contains("Done (1 concurrent requests)")
+    );
+    assert!(!done.stdout.contains(&0x1b));
+
+    fixture.status.store(503, Ordering::Release);
+    let broken = cli(&fixture).env("NO_COLOR", "1").output().unwrap();
+    assert_eq!(broken.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&broken.stderr)
+            .contains("Broken (1 concurrent requests)")
+    );
+    assert!(!broken.stderr.contains(&0x1b));
+
+    let colored = cli(&fixture)
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(colored.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&colored.stderr)
+            .contains("\x1b[91mBroken\x1b[0m")
+    );
+
+    let invalid = std::process::Command::new(env!("CARGO_BIN_EXE_brk"))
+        .arg("--unknown-option")
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+}
+
+#[cfg(all(feature = "cli", unix))]
+#[test]
+fn cli_ctrl_c_drains_owned_requests_and_exits_130() {
+    use std::process::Stdio;
+    let fixture = Fixture::new(Mode::Fixed, true);
+    let child = cli(&fixture)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let arrived = fixture.arrivals.recv_timeout(plan().timeout).is_ok();
+    let pid = child.id().try_into().unwrap();
+    // Signal only the child created by this test, after its handler is installed.
+    let signalled = arrived && unsafe { libc::kill(pid, libc::SIGINT) == 0 };
+    let result = child.wait_with_output().unwrap();
+    fixture.gate.as_ref().unwrap().release();
+    assert!(signalled);
+    assert_eq!(result.status.code(), Some(130));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Cancelled"));
+}
