@@ -3,7 +3,8 @@
   <img src="assets/logo.svg" width="96" height="96" alt="break">
 </h1>
 
-**Finds where contracts are broken**
+**Finds where contracts are broken**<br>
+<sub><em>Assuming your SLA breaks before your box does.</em></sub>
 
 `break` is an HTTP benchmark that raises concurrent load until observed failures
 exceed your SLA budget. You define the successful-response ratio and timeout;
