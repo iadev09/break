@@ -1,0 +1,26 @@
+/target/
+/target-*/
+/.cargo/
+/.cache/
+# --- Editor / IDE ---
+/.idea/
+# Share only portable editor tasks, suggestions and opt-in settings templates.
+**/.vscode/*
+!**/.vscode/extensions.json
+!**/.vscode/tasks.json
+!**/.vscode/settings.example.json
+/.nvimlog
+.history/
+.vs/
+*.swp
+*.swo
+*.swn
+*~
+.DS_Store
+Cargo.lock
+*.core
+core.*
+*.local.*
+*.local
+
+

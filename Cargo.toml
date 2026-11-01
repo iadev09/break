@@ -1,0 +1,51 @@
+[package]
+name = "break"
+version = "0.1.0"
+edition = "2024"
+description = "Find the HTTP load that breaks your SLA"
+repository = "https://github.com/iadev09/break"
+license = "MIT OR Apache-2.0"
+keywords = ["http", "benchmark", "load-testing", "capacity"]
+categories = ["command-line-utilities", "development-tools::profiling"]
+exclude = ["AGENTS.local.md", ".cargo", ".cache", "rustfmt.toml", "*.local.sh"]
+
+[workspace]
+
+[lib]
+name = "brk"
+
+[[bin]]
+name = "brk"
+path = "src/bin/brk.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:ctrlc", "dep:humantime"]
+
+[dependencies]
+# HTTP/1 transport
+bytes = "1"
+http = "1"
+httparse = "1"
+
+# Executor and asynchronous operations
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+thiserror = "2"
+
+# Optional command line
+clap = { version = "4", features = ["derive"], optional = true }
+ctrlc = { version = "3", optional = true }
+humantime = { version = "2", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+debug = 0
+panic = "unwind"
