@@ -292,6 +292,8 @@ fn real_pipelined_requests_reach_the_limit_without_waiting_for_a_response() {
         let phase = broken.stats.last_phase.unwrap();
         assert_eq!(phase.counts.sent, expected as u64);
         assert_eq!(phase.counts.successful, expected as u64);
+        assert_eq!(phase.latency.responses, expected as u64);
+        assert!(phase.latency.mean_millis().is_some());
         assert_eq!(phase.connections_at_target, plan.conn);
         assert!(phase.load.mean_outstanding() > 0.0);
         assert_eq!(fixture.connections.load(Ordering::Acquire), plan.conn);
@@ -309,6 +311,10 @@ fn successful_2xx_and_complete_bodies_produce_done_with_stats() {
     assert!(done.stats.total.successful > 4);
     assert_eq!(done.stats.total.failed(), 0);
     assert_eq!(fixture.connections.load(Ordering::Acquire), 2);
+    assert_eq!(
+        done.stats.last_phase.unwrap().latency.responses,
+        done.stats.total.successful
+    );
 }
 
 #[test]
@@ -320,6 +326,9 @@ fn close_delimited_body_finishes_at_eof_and_replaces_the_connection() {
             .unwrap();
     assert!(done.stats.total.successful > 1);
     assert_eq!(done.stats.total.failed(), 0);
+    let latency = done.stats.last_phase.unwrap().latency;
+    assert_eq!(latency.responses, done.stats.total.successful);
+    assert!(latency.mean_millis().is_some());
 }
 
 #[test]
@@ -350,6 +359,8 @@ fn incomplete_body_times_out_in_its_original_phase_before_end_callback() {
     let failed = broken.stats.last_phase.unwrap();
     assert_eq!(failed.counts.attempted, 1);
     assert_eq!(failed.counts.timeout, 1);
+    assert_eq!(failed.latency.responses, 0);
+    assert_eq!(failed.latency.mean_millis(), None);
     assert!(failed.elapsed >= plan.timeout);
     assert_eq!(observer.events, [(true, 0), (false, 0)]);
 }
@@ -367,6 +378,10 @@ fn wrong_body_is_a_failed_measured_attempt() {
     assert!(matches!(broken.reason, BreakReason::Acceptance));
     assert_eq!(broken.stats.total.successful, 0);
     assert_eq!(broken.stats.total.body, broken.stats.total.attempted);
+    assert_eq!(
+        broken.stats.last_phase.unwrap().latency.responses,
+        broken.stats.total.body
+    );
 }
 
 #[test]

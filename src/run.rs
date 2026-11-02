@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use crate::worker::{Command, Workers, receive};
 use crate::{
     Acceptance, BreakReason, Broken, CancellationToken, Counts, Done,
-    LoadStats, Observer, Phase, PhaseStats, Stats, Target,
+    LatencyStats, LoadStats, Observer, Phase, PhaseStats, Stats, Target,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -154,12 +154,14 @@ fn phases(
         let mut at_target = 0;
         let mut failure = None;
         let mut load = LoadStats::default();
+        let mut latency = LatencyStats::default();
         for reply in replies {
             match receive(reply) {
                 Ok(summary) => {
                     counts.add(summary.counts);
                     at_target += summary.at_target;
                     load.add(summary.load);
+                    latency.add(summary.latency);
                     if let Some(reason) = summary.failure {
                         failure.get_or_insert(reason);
                     }
@@ -176,6 +178,7 @@ fn phases(
             elapsed: began.elapsed(),
             connections_at_target: at_target,
             load,
+            latency,
             completed: failure.is_none() && !stop.is_cancelled(),
             cancelled: stop.is_cancelled(),
         };

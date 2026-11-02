@@ -2,6 +2,7 @@
 name = "break"
 version = "0.1.0"
 edition = "2024"
+autotests = false
 description = "Find the HTTP load that breaks your SLA"
 repository = "https://github.com/iadev09/break"
 license = "MIT OR Apache-2.0"
@@ -13,6 +14,10 @@ exclude = ["AGENTS.local.md", ".cargo", ".cache", "rustfmt.toml", "*.local.sh"]
 
 [lib]
 name = "brk"
+
+[[test]]
+name = "http1"
+path = "tests/http1.rs"
 
 [[bin]]
 name = "brk"

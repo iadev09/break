@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::decode::Decoder;
 use super::{Client, Outcome, is_local_resource};
 use crate::load::Meter;
-use crate::{BreakReason, Counts, LoadStats};
+use crate::{BreakReason, Counts, LatencyStats, LoadStats};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Window {
@@ -25,6 +25,7 @@ pub(crate) struct Summary {
     pub at_target: bool,
     pub failure: Option<BreakReason>,
     pub load: LoadStats,
+    pub latency: LatencyStats,
 }
 
 #[derive(Clone, Copy)]
@@ -33,10 +34,26 @@ struct Writing {
     began: Instant,
 }
 
+#[derive(Clone, Copy)]
+struct Attempt {
+    deadline: Instant,
+    began: Instant,
+}
+
+impl Attempt {
+    fn record_response(
+        self,
+        now: Instant,
+        latency: &mut LatencyStats,
+    ) {
+        latency.record(now.duration_since(self.began));
+    }
+}
+
 pub(crate) struct Connection {
     stream: TcpStream,
     decoder: Decoder,
-    pending: VecDeque<Instant>,
+    pending: VecDeque<Attempt>,
     buffer: Vec<u8>,
     writing: Option<Writing>,
     first_deadline: Option<Instant>,
@@ -100,6 +117,7 @@ impl Connection {
         &mut self,
         size: usize,
         counts: &mut Counts,
+        latency: &mut LatencyStats,
         meter: &mut Meter,
     ) -> Result<bool, BreakReason> {
         let mut used = 0;
@@ -112,8 +130,10 @@ impl Connection {
             let (read, reply) = self.decoder.feed(&self.buffer[used..size])?;
             used += read;
             if let Some(reply) = reply {
-                let deadline = self.pending.pop_front().unwrap();
+                let attempt = self.pending.pop_front().unwrap();
+                let deadline = attempt.deadline;
                 let now = Instant::now();
+                attempt.record_response(now, latency);
                 meter.change(
                     self.pending
                         .len()
@@ -162,7 +182,11 @@ impl Connection {
             if !admitting {
                 meter.close_admission(now);
             }
-            if self.pending.front().is_some_and(|deadline| *deadline <= now) {
+            if self
+                .pending
+                .front()
+                .is_some_and(|attempt| attempt.deadline <= now)
+            {
                 self.abandon(&mut summary.counts, Outcome::Abandoned, meter);
                 return End::Reconnect;
             }
@@ -176,10 +200,10 @@ impl Connection {
             } else {
                 Interest::READABLE
             };
-            let deadline =
-                self.pending.front().copied().map_or(end, |deadline| {
-                    if admitting { deadline.min(end) } else { deadline }
-                });
+            let deadline = self.pending.front().map_or(end, |attempt| {
+                let deadline = attempt.deadline;
+                if admitting { deadline.min(end) } else { deadline }
+            });
             let ready = tokio::select! {
                 _ = stop.cancelled(), if admitting => continue,
                 _ = phase_stop.cancelled(), if admitting => continue,
@@ -194,10 +218,12 @@ impl Connection {
                     Ok(0) => {
                         let mut complete = false;
                         if let Some(reply) = self.decoder.eof()
-                            && let Some(deadline) = self.pending.pop_front()
+                            && let Some(attempt) = self.pending.pop_front()
                         {
                             complete = true;
+                            let deadline = attempt.deadline;
                             let now = Instant::now();
+                            attempt.record_response(now, &mut summary.latency);
                             meter.change(
                                 self.pending.len().saturating_sub(usize::from(
                                     self.writing.is_some(),
@@ -224,7 +250,12 @@ impl Connection {
                         return End::Reconnect;
                     }
                     Ok(size) => {
-                        match self.receive(size, &mut summary.counts, meter) {
+                        match self.receive(
+                            size,
+                            &mut summary.counts,
+                            &mut summary.latency,
+                            meter,
+                        ) {
                             Ok(true) => {
                                 self.abandon(
                                     &mut summary.counts,
@@ -272,7 +303,7 @@ impl Connection {
                     if self
                         .pending
                         .front()
-                        .is_some_and(|deadline| *deadline <= now)
+                        .is_some_and(|attempt| attempt.deadline <= now)
                     {
                         break;
                     }
@@ -288,7 +319,8 @@ impl Connection {
                             .first_deadline
                             .take()
                             .unwrap_or(now + window.timeout);
-                        self.pending.push_back(deadline);
+                        self.pending
+                            .push_back(Attempt { deadline, began: now });
                         self.writing = Some(Writing { offset: 0, began: now });
                     }
                     let writing = self.writing.unwrap();
@@ -354,14 +386,15 @@ fn io_outcome(error: &io::Error) -> Outcome {
 }
 
 fn retire_attempts(
-    deadlines: impl Iterator<Item = Instant>,
+    attempts: impl Iterator<Item = Attempt>,
     counts: &mut Counts,
     cause: Outcome,
     meter: &mut Meter,
     now: Instant,
 ) {
     let mut direct = Some(cause);
-    for deadline in deadlines {
+    for attempt in attempts {
+        let deadline = attempt.deadline;
         let outcome = if deadline <= now {
             meter.expired(deadline, now);
             Outcome::Timeout
@@ -444,48 +477,5 @@ pub(crate) async fn run_slot(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn timeout_retirement_separates_expired_attempts_from_unexpired_followers()
-    {
-        let start = Instant::now();
-        let mut meter = Meter::new(start, Duration::from_secs(10), 3);
-        let mut counts = Counts::default();
-        retire_attempts(
-            [1, 5, 6]
-                .into_iter()
-                .map(|seconds| start + Duration::from_secs(seconds)),
-            &mut counts,
-            Outcome::Abandoned,
-            &mut meter,
-            start + Duration::from_secs(2),
-        );
-        assert_eq!(counts.attempted, 3);
-        assert_eq!(counts.timeout, 1);
-        assert_eq!(counts.abandoned, 2);
-        assert_eq!(counts.transport, 0);
-    }
-
-    #[test]
-    fn a_transport_incident_does_not_become_one_independent_fault_per_pending_request()
-     {
-        let start = Instant::now();
-        let mut meter = Meter::new(start, Duration::from_secs(10), 3);
-        let mut counts = Counts::default();
-        retire_attempts(
-            [5, 6, 7]
-                .into_iter()
-                .map(|seconds| start + Duration::from_secs(seconds)),
-            &mut counts,
-            Outcome::Transport,
-            &mut meter,
-            start + Duration::from_secs(2),
-        );
-        assert_eq!(counts.attempted, 3);
-        assert_eq!(counts.transport, 1);
-        assert_eq!(counts.abandoned, 2);
-        assert_eq!(counts.timeout, 0);
-    }
-}
+#[path = "../../tests/http1/connection.rs"]
+mod tests;

@@ -13,6 +13,12 @@
   target, setup/send/deadline diagnostics. Owners aggregate once per phase without
   shared counters, sampling tasks or polling. First attainment is not a claim of
   sustained or simultaneous global load.
+- `src/latency.rs`: phase-local completed-response timing sums and sample counts.
+  Admission timestamps are stored beside FIFO deadlines after TCP setup; existing
+  response observation timestamps are reused. Complete replies, including drain
+  and late/invalid replies, contribute; incomplete/retired attempts do not. Worker
+  aggregation combines sums/counts without shared request counters. Mean request
+  latency excludes setup even though the first request's SLA deadline includes it.
 
 ## Execution
 
@@ -67,11 +73,15 @@ parallelism. Protocol-specific scheduling does not change the phase contract.
 
 ## Tests
 
+- `tests/latency.rs`: empty sample sets and response-weighted aggregation.
+- `tests/http1/connection.rs`: request timing independent of setup/deadline,
+  complete late responses and direct errors versus cascaded abandoned attempts.
+- `tests/report.rs`: acceptance guards when connection targets are unfulfilled.
+
 - `src/acceptance.rs`: exact percentage boundaries.
 - `src/run.rs`: plan validation before traffic.
 - `src/load.rs`: observed load versus first attainment, separate owners reaching
   their targets at different times, and drain/cancellation boundaries.
-- `src/http1/connection.rs`: direct errors versus cascaded abandoned attempts.
 - `src/http1.rs`: URL and client-resource classification.
 - `src/http1/decode.rs`: arbitrary fragmentation, interim/chunked/pipelined
   responses, invalid framing and dynamically sized header fields.

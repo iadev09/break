@@ -202,6 +202,15 @@ impl Observer for Printer {
             humantime::format_duration(stats.load.active_elapsed),
             humantime::format_duration(stats.drain_elapsed())
         );
+        match stats.latency.mean_millis() {
+            Some(mean) => println!(
+                "  request-avg-ms={mean:.3} completed-response-samples={} (TCP setup excluded)",
+                stats.latency.responses
+            ),
+            None => println!(
+                "  request-avg-ms=n/a completed-response-samples=0 (TCP setup excluded)"
+            ),
+        }
         println!(
             "  connect-attempts={} setup-seconds={:.6} write-blocked={} max-send-delay={} max-deadline-lateness={}",
             stats.load.connect_attempts,

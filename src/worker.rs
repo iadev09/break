@@ -6,7 +6,9 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::{mpsc as async_mpsc, watch};
 
 use crate::http1::{Client, Connection, Prepared, Window, run_slot};
-use crate::{BreakReason, CancellationToken, Counts, LoadStats, Phase};
+use crate::{
+    BreakReason, CancellationToken, Counts, LatencyStats, LoadStats, Phase,
+};
 
 pub(crate) struct Command {
     pub phase: Phase,
@@ -23,6 +25,7 @@ pub(crate) struct Summary {
     pub at_target: usize,
     pub failure: Option<BreakReason>,
     pub load: LoadStats,
+    pub latency: LatencyStats,
 }
 
 struct Worker {
@@ -181,6 +184,7 @@ async fn serve(
                 summary.counts.add(result.counts);
                 summary.at_target += usize::from(result.at_target);
                 summary.load.add(result.load);
+                summary.latency.add(result.latency);
                 if let Some(failure) = result.failure {
                     summary.failure.get_or_insert(failure);
                 }

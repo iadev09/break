@@ -145,4 +145,23 @@ CPU and server CPU are separate measurements. Both result variants retain stats.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for module boundaries.
 
+### Mean request latency
+
+Every phase exposes `PhaseStats::latency`: the completed-response sample count,
+exact sum in nanoseconds, and `mean_millis()` (`None` without a sample). The CLI
+prints `request-avg-ms` and the sample count for every phase.
+
+Timing starts when a request is admitted to its connection's write path, after
+TCP setup, and ends after the complete HTTP response body is decoded and checked.
+It includes write backpressure, queueing, network/response wait and client-side
+validation, including drain. It is not server-handler CPU time. TCP setup remains
+separate in `LoadStats`. The first request's existing deadline still includes
+connection setup; adding request latency does not change acceptance or deadlines.
+
+All fully decoded replies contribute, including late or status/body-failing
+responses. Attempts without a complete response have no latency sample and are
+never added as zero-duration replies; read the error counts alongside the mean.
+Workers merge sums and counts, rather than averaging connection means. No
+per-request task, shared counter, allocation or additional clock read is added.
+
 Licensed under MIT OR Apache-2.0.
