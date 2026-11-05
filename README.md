@@ -50,8 +50,8 @@ Exit codes: `0` Done, `1` Broken, `2` argument parsing errors, `130` Ctrl-C.
 - `--max`: optional per-connection ceiling. Without it there is no fixed final
   phase. Reaching it reports tested load, not a server breakpoint.
 - `--expect-body`: additionally require an exact response body.
-- `--threads`: client worker threads. Not part of the load; see
-  [What `--threads` is](#what---threads-is).
+- `--threads`: client worker threads. Optional, but advised. Not part of the
+  load; see [What `--threads` is](#what---threads-is).
 - `--connect`: connect to this address instead of resolving the URL's host. The
   URL still supplies the `Host` header and, for `https://`, the server name.
 - `--cacert`: for `https://`, trust the authorities in this PEM file instead of
@@ -75,6 +75,11 @@ measurement and not something to tune for a better number: it only bounds how
 much of the machine the client may use while it drives the declared load. It
 exists so that a run is possible at all where client and server share a
 machine.
+
+It is optional, and declaring it is advised. The default depends on the
+machine the client happens to run on, so a run that leaves it out is not the
+same run elsewhere; a declared count is a stated condition that another run
+can repeat.
 
 - **Without it** there is one thread for every CPU the process may run on
   (following CPU affinity and cgroup quota where the platform has them), never
