@@ -82,6 +82,8 @@ keep the two sides on separate CPUs, give each its own set with the
 platform's tool, such as `taskset` on Linux.
 
 The adapter implements HTTP/1.1 GET with actual pipelining on each connection.
+Requests admitted together are written together: one write carries as many as
+the socket takes, and each keeps its own admission time and deadline.
 It reads ordered responses while filling free request slots, reuses connections
 across phases, and validates complete bodies without text decoding.
 Content-Length, chunked and close-delimited bodies are supported. Unsupported or

@@ -37,12 +37,25 @@ pub(crate) struct Summary {
     pub tls: Option<crate::Negotiated>,
 }
 
+/// Requests admitted together and not yet all handed to the socket. They
+/// are written together: one write carries as many as the socket takes.
 #[derive(Clone, Copy)]
 struct Writing {
+    /// Bytes of the burst the socket has taken.
     offset: usize,
+    /// Requests in the burst, and the length of each.
+    count: usize,
+    each: usize,
     began: Instant,
     /// The connection's last request, which asks the peer to close.
     closing: bool,
+}
+
+impl Writing {
+    /// Requests of the burst that are not completely sent.
+    fn unsent(&self) -> usize {
+        self.count - self.offset / self.each
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -183,9 +196,9 @@ impl Conn {
         let mut buffer = Vec::new();
         // This is an I/O chunk, not a response-size or request-concurrency limit.
         buffer
-            .try_reserve(16 * 1024)
+            .try_reserve(super::CHUNK)
             .map_err(|_| BreakReason::Resources("socket read buffer"))?;
-        buffer.resize(16 * 1024, 0);
+        buffer.resize(super::CHUNK, 0);
         Ok(Self {
             stream,
             decoder: Decoder::new(client.status, client.body.clone()),
@@ -202,6 +215,11 @@ impl Conn {
 
     pub(super) fn stream(&self) -> &Stream {
         &self.stream
+    }
+
+    /// Admitted requests the socket has not completely taken.
+    fn unsent(&self) -> usize {
+        self.writing.map_or(0, |writing| writing.unsent())
     }
 
     pub(super) fn socket(&mut self) -> &mut TcpStream {
@@ -280,9 +298,7 @@ impl Conn {
                 let deadline = attempt.deadline;
                 attempt.record_response(now, latency);
                 meter.change(
-                    self.pending
-                        .len()
-                        .saturating_sub(usize::from(self.writing.is_some())),
+                    self.pending.len().saturating_sub(self.unsent()),
                     now,
                 );
                 if now >= deadline {
@@ -357,9 +373,9 @@ impl Conn {
                             let deadline = attempt.deadline;
                             attempt.record_response(now, &mut summary.latency);
                             meter.change(
-                                self.pending.len().saturating_sub(usize::from(
-                                    self.writing.is_some(),
-                                )),
+                                self.pending
+                                    .len()
+                                    .saturating_sub(self.unsent()),
                                 now,
                             );
                             if now >= deadline {
@@ -451,29 +467,53 @@ impl Conn {
                     {
                         break;
                     }
-                    let deadline = match self.first_deadline.take() {
-                        Some(deadline) => deadline,
-                        None => {
-                            let deadline = now + window.timeout;
-                            turn.timers.push_back((deadline, turn.owner));
-                            deadline
-                        }
-                    };
-                    self.pending.push_back(Attempt { deadline, began: now });
+                    // Every free slot is admitted now, with this instant and
+                    // its deadline, whether or not the socket takes all of
+                    // them at once. The connection test admits one at a time.
                     let closing = self.remaining == Some(1);
-                    if let Some(remaining) = &mut self.remaining {
-                        *remaining -= 1;
+                    let count = match &mut self.remaining {
+                        Some(remaining) => {
+                            *remaining -= 1;
+                            1
+                        }
+                        None => (window.per_connection - self.pending.len())
+                            .min(turn.client.burst()),
+                    };
+                    let each = if closing {
+                        turn.client.closing.len()
+                    } else {
+                        turn.client.request.len()
+                    };
+                    let mut timed = false;
+                    for _ in 0..count {
+                        let deadline = match self.first_deadline.take() {
+                            Some(deadline) => deadline,
+                            None => {
+                                timed = true;
+                                now + window.timeout
+                            }
+                        };
+                        self.pending.push_back(Attempt { deadline, began: now });
                     }
-                    self.writing =
-                        Some(Writing { offset: 0, began: now, closing });
+                    if timed {
+                        // One entry wakes the owner for all of them.
+                        turn.timers.push_back((now + window.timeout, turn.owner));
+                    }
+                    self.writing = Some(Writing {
+                        offset: 0,
+                        count,
+                        each,
+                        began: now,
+                        closing,
+                    });
                 }
                 let writing = self.writing.unwrap();
-                let request = if writing.closing {
-                    &turn.client.closing
+                let bytes = if writing.closing {
+                    &turn.client.closing[..]
                 } else {
-                    &turn.client.request
+                    &turn.client.requests[..writing.count * writing.each]
                 };
-                match self.stream.write(&request[writing.offset..]) {
+                match self.stream.write(&bytes[writing.offset..]) {
                     Ok(0) => {
                         self.abandon(
                             &mut summary.counts,
@@ -483,18 +523,23 @@ impl Conn {
                         return Step::End(End::Reconnect);
                     }
                     Ok(written) => {
-                        let next = writing.offset + written;
-                        if next == request.len() {
-                            self.writing = None;
-                            summary.counts.sent += 1;
+                        let sent = Writing {
+                            offset: writing.offset + written,
+                            ..writing
+                        };
+                        let completed = writing.unsent() - sent.unsent();
+                        self.writing =
+                            (sent.offset < bytes.len()).then_some(sent);
+                        if completed > 0 {
+                            summary.counts.sent += completed as u64;
                             meter.stats.max_send_delay = meter
                                 .stats
                                 .max_send_delay
                                 .max(now.duration_since(writing.began));
-                            meter.change(self.pending.len(), now);
-                        } else {
-                            self.writing =
-                                Some(Writing { offset: next, ..writing });
+                            meter.change(
+                                self.pending.len() - sent.unsent(),
+                                now,
+                            );
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {

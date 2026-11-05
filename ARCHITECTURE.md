@@ -46,7 +46,9 @@
 - `src/http1/connection.rs`: actual HTTP/1 pipelining, partial writes, FIFO
   request deadlines and what ends a connection, as a state the engine turns.
   One turn does what was due, one read and the requests its free slots admit,
-  then says whether it waits or has more. No per-request task or shared request
+  then says whether it waits or has more. The free slots are admitted at one
+  instant and leave in one write, as far as the socket takes them; a request
+  counts as sent, and enters the load integral, when its last byte has gone. No per-request task or shared request
   counter. A response releases its slot only after complete-body validation.
   Socket-read chunks are not payload or concurrency limits. Declared
   phase/deadline timers do not pace requests. Fully sent requests

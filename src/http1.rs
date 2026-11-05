@@ -330,6 +330,10 @@ impl Target {
         );
         Ok(Prepared {
             addresses,
+            requests: request
+                .as_bytes()
+                .repeat((CHUNK / request.len()).max(1))
+                .into(),
             request: request.into_bytes(),
             closing: closing.into_bytes(),
             status: self.status,
@@ -344,8 +348,15 @@ impl Target {
     }
 }
 
+/// An I/O chunk: how much one read asks for and one write offers. It bounds
+/// neither a response's size nor how many requests are outstanding.
+pub(crate) const CHUNK: usize = 16 * 1024;
+
 pub(crate) struct Prepared {
     addresses: Arc<[SocketAddr]>,
+    /// The request, repeated as often as fits a chunk: requests admitted
+    /// together leave in one write.
+    requests: Arc<[u8]>,
     request: Vec<u8>,
     closing: Vec<u8>,
     status: Option<StatusCode>,
@@ -360,6 +371,7 @@ impl Prepared {
     pub(crate) fn client(&self) -> Client {
         Client {
             addresses: self.addresses.clone(),
+            requests: self.requests.clone(),
             request: self.request.clone().into_boxed_slice(),
             closing: self.closing.clone().into_boxed_slice(),
             status: self.status,
@@ -374,6 +386,7 @@ impl Prepared {
 
 pub(crate) struct Client {
     addresses: Arc<[SocketAddr]>,
+    requests: Arc<[u8]>,
     request: Box<[u8]>,
     closing: Box<[u8]>,
     pub(crate) status: Option<StatusCode>,
@@ -382,6 +395,13 @@ pub(crate) struct Client {
     tls: Option<transport::secure::Tls>,
     #[cfg(feature = "http2")]
     pub(crate) http2: Option<crate::http2::Head>,
+}
+
+impl Client {
+    /// How many requests one write can carry.
+    fn burst(&self) -> usize {
+        self.requests.len() / self.request.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
