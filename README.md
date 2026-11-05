@@ -137,6 +137,24 @@ Sessions are resumed by default, as returning clients do; each phase reports
 how many established connections resumed. A server whose session cache does
 not serve a returning visitor shows up as full handshakes.
 
+## HTTP/2
+
+`--http2` runs either test over HTTP/2. Over `https://` only `h2` is offered
+during the handshake; over `http://` the connection starts with prior
+knowledge. A server that does not speak it fails setup.
+
+In the request test the level is then concurrent streams on a connection,
+where HTTP/1.1 pipelines requests: the connections stay fixed and each phase
+opens more streams on them. A connection is established once the peer's
+settings have arrived, within the setup deadline, so no stream is opened on an
+assumed limit. A peer whose stream limit is below the level leaves the phase
+unfulfilled, which is its policy and not a capacity break. A stream that
+misses its deadline is reset and counted as a timeout; the connection and its
+other streams stay, where an HTTP/1.1 timeout retires the whole connection.
+
+In the connection test each connection carries its declared number of
+streams, one at a time, and then says goodbye and closes.
+
 `Done` means the declared ceiling was completed. `Broken` retains the reason,
 last tested phase, last accepted phase and counters. Acceptance failure is distinct
 from client I/O/resource failure, invalid protocol data or an unfulfilled target.

@@ -2,6 +2,8 @@
 
 mod acceptance;
 mod http1;
+#[cfg(feature = "http2")]
+mod http2;
 mod latency;
 mod load;
 mod report;

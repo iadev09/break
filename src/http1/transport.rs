@@ -103,6 +103,73 @@ impl Transport {
     }
 }
 
+/// HTTP/2 framing drives a connection through polls. The same socket and the
+/// same TLS session answer them.
+#[cfg(feature = "http2")]
+mod polled {
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use super::Transport;
+
+    impl AsyncRead for Transport {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.get_mut() {
+                Transport::Plain(stream) => {
+                    Pin::new(stream).poll_read(cx, buffer)
+                }
+                #[cfg(feature = "tls")]
+                Transport::Tls(secure) => secure.poll_read(cx, buffer),
+            }
+        }
+    }
+
+    impl AsyncWrite for Transport {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            match self.get_mut() {
+                Transport::Plain(stream) => {
+                    Pin::new(stream).poll_write(cx, bytes)
+                }
+                #[cfg(feature = "tls")]
+                Transport::Tls(secure) => secure.poll_write(cx, bytes),
+            }
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.get_mut() {
+                Transport::Plain(stream) => Pin::new(stream).poll_flush(cx),
+                #[cfg(feature = "tls")]
+                Transport::Tls(secure) => secure.poll_flush(cx),
+            }
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.get_mut() {
+                Transport::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+                #[cfg(feature = "tls")]
+                Transport::Tls(secure) => secure.poll_shutdown(cx),
+            }
+        }
+    }
+}
+
 #[cfg(feature = "tls")]
 pub(crate) mod secure {
     use std::io::{self, ErrorKind, Read, Write};
@@ -325,6 +392,62 @@ pub(crate) mod secure {
             let written = self.session.writer().write(bytes)?;
             self.flush()?;
             Ok(written)
+        }
+    }
+
+    /// The same reads and writes for a caller that polls.
+    #[cfg(feature = "http2")]
+    impl Secure {
+        pub(super) fn poll_read(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            loop {
+                match self.try_read(buffer.initialize_unfilled()) {
+                    Ok(size) => {
+                        buffer.advance(size);
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::task::ready!(self.stream.poll_read_ready(cx))?;
+                    }
+                    Err(error) => return std::task::Poll::Ready(Err(error)),
+                }
+            }
+        }
+
+        pub(super) fn poll_write(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            // Records already owed go first, as in `try_write`.
+            std::task::ready!(self.poll_flush(cx))?;
+            let written = self.session.writer().write(bytes)?;
+            self.flush()?;
+            std::task::Poll::Ready(Ok(written))
+        }
+
+        pub(super) fn poll_flush(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            loop {
+                self.flush()?;
+                if !self.session.wants_write() {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                std::task::ready!(self.stream.poll_write_ready(cx))?;
+            }
+        }
+
+        pub(super) fn poll_shutdown(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            self.session.send_close_notify();
+            self.poll_flush(cx)
         }
     }
 }

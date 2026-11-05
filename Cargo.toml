@@ -28,22 +28,32 @@ required-features = ["tls"]
 name = "connections"
 path = "tests/connections.rs"
 
+[[test]]
+name = "http2"
+path = "tests/http2.rs"
+required-features = ["http2", "tls"]
+
 [[bin]]
 name = "brk"
 path = "src/bin/brk.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli", "tls"]
+default = ["cli", "tls", "http2"]
 cli = ["dep:clap", "dep:ctrlc", "dep:humantime"]
 # `https://` targets: HTTP/1.1 over TLS, with the same pipelining.
 tls = ["dep:rustls", "dep:rustls-native-certs"]
+# `--http2`: the same tests over HTTP/2 streams.
+http2 = ["dep:h2"]
 
 [dependencies]
 # HTTP/1 transport
 bytes = "1"
 http = "1"
 httparse = "1"
+
+# Optional HTTP/2 framing
+h2 = { version = "0.4", optional = true }
 
 # Optional TLS transport
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
@@ -66,6 +76,8 @@ libc = "0.2"
 [dev-dependencies]
 # A throwaway certificate for the TLS fixture.
 rcgen = "0.14"
+# The HTTP/2 fixture's TLS listener.
+tokio-rustls = { version = "0.26", default-features = false }
 
 [profile.release]
 opt-level = 3

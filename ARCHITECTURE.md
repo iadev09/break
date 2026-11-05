@@ -45,6 +45,12 @@
   waiting for the socket. The handshake completes inside connection setup.
   The target may declare the version, key exchange group and cipher suite it
   offers; what a connection negotiated is reported with each phase.
+- `src/http2.rs`: the same owner loop over HTTP/2 (`http2` feature). One
+  future per connection polls the connection's driver, opens streams while the
+  level and the peer's limit allow, and collects each stream's outcome. A
+  stream has its own deadline; missing it drops and resets that stream alone.
+  Setup ends when the peer's settings have arrived. The framing drives the
+  transport through polls, which the TCP stream and the TLS session answer.
 - `src/http1/decode.rs`: incremental response framing with httparse. Handles
   interim responses, Content-Length, chunked/trailers, close-delimited bodies and
   coalesced/fragmented replies. Payload bytes are checked in place. Ambiguous or
@@ -127,6 +133,10 @@ parallelism. Protocol-specific scheduling does not change the phase contract.
   connection carries its declared requests, asks to close on the last and is
   replaced; a refused setup breaks the connection contract and counts no
   request.
+- `tests/http2.rs`: both tests over HTTP/2 against a real server, in
+  cleartext and over TLS: streams multiplying on fixed connections, a peer's
+  stream limit leaving a phase unfulfilled, and connections replaced after
+  their streams.
 - `tests/cli.rs`: the two tests' names, short forms and separate options.
 - `src/cli.rs`: numeric load controls and unsupported-option rejection.
 - `tests/http1.rs`: real ephemeral TCP fixtures; fixed connections and growing

@@ -65,6 +65,12 @@ struct Common {
     #[cfg(feature = "tls")]
     #[arg(long, value_name = "NAME")]
     tls_cipher: Option<String>,
+    /// Speak HTTP/2: only h2 is offered over https://, and http:// starts
+    /// with prior knowledge. The request test's level is then concurrent
+    /// streams per connection.
+    #[cfg(feature = "http2")]
+    #[arg(long)]
+    http2: bool,
     /// Time at each level, for example 10s.
     #[arg(long, value_parser = humantime::parse_duration)]
     phase: Duration,
@@ -280,6 +286,10 @@ fn target(common: &Common) -> Result<Target, BreakReason> {
         if let Some(cipher) = &common.tls_cipher {
             target = target.tls_cipher(cipher)?;
         }
+    }
+    #[cfg(feature = "http2")]
+    if common.http2 {
+        target = target.http2();
     }
     if let Some(body) = &common.expect_body {
         target = target.expect_body(body.clone().into_bytes());

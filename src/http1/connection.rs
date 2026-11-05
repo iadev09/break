@@ -71,10 +71,109 @@ pub(crate) struct Connection {
     peer_closing: bool,
 }
 
-enum End {
+pub(crate) enum End {
     Retain,
     Reconnect,
     Failed(BreakReason),
+}
+
+/// One connection of the protocol the target speaks, as its owner drives it.
+/// The owner's loop, its setup accounting and its phase rules are the same
+/// for every protocol; only what happens on the connection differs.
+pub(crate) trait Carrier: Sized {
+    async fn connect(
+        client: &Client,
+        window: Window,
+        stop: &CancellationToken,
+        sessions: Option<&Sessions>,
+    ) -> Result<Self, BreakReason>;
+
+    async fn exchange(
+        &mut self,
+        client: &Client,
+        window: Window,
+        stop: &CancellationToken,
+        phase_stop: &CancellationToken,
+        summary: &mut Summary,
+        meter: &mut Meter,
+    ) -> End;
+
+    fn negotiated(&self) -> Option<crate::Negotiated>;
+
+    fn resumed(&self) -> bool;
+
+    /// Let a connection that reached the end of its declared lifetime end.
+    async fn retire(
+        self,
+        window: Window,
+    );
+}
+
+/// Establish the transport of one connection within the setup deadline: the
+/// TCP stream and, for an `https://` target, its TLS handshake.
+pub(crate) async fn open(
+    client: &Client,
+    window: Window,
+    stop: &CancellationToken,
+    sessions: Option<&Sessions>,
+) -> Result<(Transport, Instant), BreakReason> {
+    let deadline = Instant::now() + window.timeout;
+    let stream = tokio::select! {
+        _ = stop.cancelled() => return Err(BreakReason::Cancelled),
+        result = tokio::time::timeout_at(deadline.into(), async {
+            let stream =
+                TcpStream::connect(client.addresses.as_ref()).await?;
+            stream.set_nodelay(true)?;
+            // An `https://` target is connected once its handshake is done.
+            Transport::open(stream, client, sessions).await
+        }) => {
+            result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection deadline exceeded"))??
+        }
+    };
+    Ok((stream, deadline))
+}
+
+impl Carrier for Connection {
+    async fn connect(
+        client: &Client,
+        window: Window,
+        stop: &CancellationToken,
+        sessions: Option<&Sessions>,
+    ) -> Result<Self, BreakReason> {
+        Connection::connect(client, window, stop, sessions).await
+    }
+
+    async fn exchange(
+        &mut self,
+        client: &Client,
+        window: Window,
+        stop: &CancellationToken,
+        phase_stop: &CancellationToken,
+        summary: &mut Summary,
+        meter: &mut Meter,
+    ) -> End {
+        Connection::exchange(
+            self, client, window, stop, phase_stop, summary, meter,
+        )
+        .await
+    }
+
+    fn negotiated(&self) -> Option<crate::Negotiated> {
+        self.stream.negotiated()
+    }
+
+    fn resumed(&self) -> bool {
+        self.stream.resumed()
+    }
+
+    async fn retire(
+        mut self,
+        window: Window,
+    ) {
+        if self.peer_closing {
+            self.await_peer_close(Instant::now() + window.timeout).await;
+        }
+    }
 }
 
 impl Connection {
@@ -84,19 +183,7 @@ impl Connection {
         stop: &CancellationToken,
         sessions: Option<&Sessions>,
     ) -> Result<Self, BreakReason> {
-        let deadline = Instant::now() + window.timeout;
-        let stream = tokio::select! {
-            _ = stop.cancelled() => return Err(BreakReason::Cancelled),
-            result = tokio::time::timeout_at(deadline.into(), async {
-                let stream =
-                    TcpStream::connect(client.addresses.as_ref()).await?;
-                stream.set_nodelay(true)?;
-                // An `https://` target is connected once its handshake is done.
-                Transport::open(stream, client, sessions).await
-            }) => {
-                result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection deadline exceeded"))??
-            }
-        };
+        let (stream, deadline) = open(client, window, stop, sessions).await?;
         let mut buffer = Vec::new();
         // This is an I/O chunk, not a response-size or request-concurrency limit.
         buffer
@@ -468,13 +555,13 @@ fn retire_attempts(
 }
 
 /// One persistent owner per declared connection, not one task per request.
-pub(crate) async fn run_slot(
+pub(crate) async fn run_owner<C: Carrier>(
     client: &Client,
-    mut connection: Option<Connection>,
+    mut connection: Option<C>,
     window: Window,
     stop: &CancellationToken,
     phase_stop: &CancellationToken,
-) -> (Option<Connection>, Summary) {
+) -> (Option<C>, Summary) {
     let mut summary = Summary::default();
     let mut meter =
         Meter::new(window.start, window.duration, window.per_connection);
@@ -492,21 +579,20 @@ pub(crate) async fn run_slot(
             }
             let began = Instant::now();
             let connected =
-                Connection::connect(client, window, stop, sessions.as_ref())
-                    .await;
+                C::connect(client, window, stop, sessions.as_ref()).await;
             let setup = began.elapsed();
             meter.stats.connect_attempts += 1;
             meter.stats.connect_nanos += setup.as_nanos();
             match connected {
                 Ok(opened) => {
                     if summary.tls.is_none() {
-                        summary.tls = opened.stream.negotiated();
+                        summary.tls = opened.negotiated();
                     }
                     if churn {
                         let setups = &mut summary.setups;
                         setups.attempted += 1;
                         setups.established += 1;
-                        setups.resumed += u64::from(opened.stream.resumed());
+                        setups.resumed += u64::from(opened.resumed());
                         setups.established_nanos += setup.as_nanos();
                         setups.longest = setups.longest.max(setup);
                     }
@@ -555,13 +641,10 @@ pub(crate) async fn run_slot(
         {
             End::Retain => break,
             End::Reconnect => {
-                if let Some(mut ended) = connection.take()
+                if let Some(ended) = connection.take()
                     && churn
-                    && ended.peer_closing
                 {
-                    ended
-                        .await_peer_close(Instant::now() + window.timeout)
-                        .await;
+                    ended.retire(window).await;
                 }
             }
             End::Failed(error) => {
@@ -575,7 +658,7 @@ pub(crate) async fn run_slot(
     if let Some(connection) = &connection
         && summary.tls.is_none()
     {
-        summary.tls = connection.stream.negotiated();
+        summary.tls = connection.negotiated();
     }
     summary.load = meter.finish(Instant::now());
     summary.at_target = summary.load.latest_first_target.is_some();

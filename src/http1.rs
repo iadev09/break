@@ -9,7 +9,56 @@ use bytes::Bytes;
 use http::{StatusCode, Uri};
 
 use crate::{BreakReason, Counts};
-pub(crate) use connection::{Connection, Window, run_slot};
+#[cfg(feature = "http2")]
+pub(crate) use connection::{Carrier, End, open};
+pub(crate) use connection::{Summary, Window, run_owner};
+#[cfg(feature = "http2")]
+pub(crate) use transport::{Sessions, Transport};
+
+/// A kept connection of whichever protocol the target speaks.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "an HTTP/1.1 connection stays inline in its owner's slot, as it was before another protocol existed; every slot of a run holds the same variant"
+)]
+pub(crate) enum Connection {
+    H1(connection::Connection),
+    #[cfg(feature = "http2")]
+    H2(Box<crate::http2::Connection>),
+}
+
+impl Connection {
+    fn into_h1(self) -> Option<connection::Connection> {
+        match self {
+            Self::H1(kept) => Some(kept),
+            #[cfg(feature = "http2")]
+            Self::H2(_) => None,
+        }
+    }
+}
+
+/// Run one owner for a phase over the target's protocol.
+pub(crate) async fn run_slot(
+    client: &Client,
+    kept: Option<Connection>,
+    window: Window,
+    stop: &tokio_util::sync::CancellationToken,
+    phase_stop: &tokio_util::sync::CancellationToken,
+) -> (Option<Connection>, Summary) {
+    #[cfg(feature = "http2")]
+    if client.http2.is_some() {
+        let kept = kept.and_then(|kept| match kept {
+            Connection::H2(kept) => Some(*kept),
+            Connection::H1(_) => None,
+        });
+        let (kept, summary) =
+            run_owner(client, kept, window, stop, phase_stop).await;
+        return (kept.map(|kept| Connection::H2(Box::new(kept))), summary);
+    }
+    let kept = kept.and_then(Connection::into_h1);
+    let (kept, summary) =
+        run_owner(client, kept, window, stop, phase_stop).await;
+    (kept.map(Connection::H1), summary)
+}
 
 /// One GET target and optional exact response validation.
 ///
@@ -27,6 +76,8 @@ pub struct Target {
     resume: bool,
     #[cfg(feature = "tls")]
     offer: Offer,
+    #[cfg(feature = "http2")]
+    http2: bool,
 }
 
 /// What an `https://` target's handshakes offer, where the caller declared
@@ -84,6 +135,8 @@ impl Target {
             resume: true,
             #[cfg(feature = "tls")]
             offer: Offer::default(),
+            #[cfg(feature = "http2")]
+            http2: false,
         })
     }
 
@@ -126,6 +179,23 @@ impl Target {
     pub fn without_resumption(mut self) -> Self {
         self.resume = false;
         self
+    }
+
+    /// Speak HTTP/2. Over `https://` only `h2` is offered; over `http://`
+    /// the connection starts with prior knowledge. The request test's level
+    /// is then concurrent streams on a connection.
+    #[cfg(feature = "http2")]
+    pub fn http2(mut self) -> Self {
+        self.http2 = true;
+        self
+    }
+
+    #[cfg(feature = "tls")]
+    fn speaks_http2(&self) -> bool {
+        #[cfg(feature = "http2")]
+        return self.http2;
+        #[cfg(not(feature = "http2"))]
+        false
     }
 
     /// Offer only this TLS version: `1.2` or `1.3`.
@@ -234,7 +304,11 @@ impl Target {
         })?
         .with_root_certificates(roots)
         .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![if self.speaks_http2() {
+            b"h2".to_vec()
+        } else {
+            b"http/1.1".to_vec()
+        }];
         if !self.resume {
             config.resumption = rustls::client::Resumption::disabled();
         }
@@ -299,6 +373,10 @@ impl Target {
             body: self.body.clone(),
             #[cfg(feature = "tls")]
             tls,
+            #[cfg(feature = "http2")]
+            http2: self
+                .http2
+                .then(|| crate::http2::Head { uri: self.uri.clone() }),
         })
     }
 }
@@ -311,6 +389,8 @@ pub(crate) struct Prepared {
     body: Option<Bytes>,
     #[cfg(feature = "tls")]
     tls: Option<transport::secure::Tls>,
+    #[cfg(feature = "http2")]
+    http2: Option<crate::http2::Head>,
 }
 
 impl Prepared {
@@ -323,6 +403,8 @@ impl Prepared {
             body: self.body.clone(),
             #[cfg(feature = "tls")]
             tls: self.tls.clone(),
+            #[cfg(feature = "http2")]
+            http2: self.http2.clone(),
         }
     }
 }
@@ -331,10 +413,12 @@ pub(crate) struct Client {
     addresses: Arc<[SocketAddr]>,
     request: Box<[u8]>,
     closing: Box<[u8]>,
-    status: Option<StatusCode>,
-    body: Option<Bytes>,
+    pub(crate) status: Option<StatusCode>,
+    pub(crate) body: Option<Bytes>,
     #[cfg(feature = "tls")]
     tls: Option<transport::secure::Tls>,
+    #[cfg(feature = "http2")]
+    pub(crate) http2: Option<crate::http2::Head>,
 }
 
 #[derive(Clone, Copy, Debug)]
