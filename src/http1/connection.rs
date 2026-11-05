@@ -99,6 +99,14 @@ impl Stream {
         }
     }
 
+    pub(super) fn socket(&mut self) -> &mut TcpStream {
+        match self {
+            Self::Plain(stream) => stream,
+            #[cfg(feature = "tls")]
+            Self::Tls(secure) => secure.socket(),
+        }
+    }
+
     pub(super) fn negotiated(&self) -> Option<crate::Negotiated> {
         match self {
             Self::Plain(_) => None,
@@ -194,6 +202,10 @@ impl Conn {
 
     pub(super) fn stream(&self) -> &Stream {
         &self.stream
+    }
+
+    pub(super) fn socket(&mut self) -> &mut TcpStream {
+        self.stream.socket()
     }
 
     /// Room for a phase's requests, before any of them is admitted.

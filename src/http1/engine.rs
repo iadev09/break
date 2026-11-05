@@ -83,6 +83,10 @@ enum State {
 struct Owner {
     state: State,
     flags: Flags,
+    /// The socket is registered for write readiness. It is only while the
+    /// owner believes it full or not yet connected: a socket with room
+    /// would otherwise report every change of that room.
+    armed: bool,
     /// Waiting in the run queue.
     queued: bool,
     /// Finished this phase.
@@ -193,6 +197,7 @@ impl Owner {
             Interest::READABLE | Interest::WRITABLE,
         )?;
         self.flags = Flags::default();
+        self.armed = true;
         self.state = State::Setup(Setup {
             began,
             deadline,
@@ -294,6 +299,52 @@ impl Owner {
     }
 
     fn turn(
+        &mut self,
+        index: usize,
+        phase: &mut Phase<'_>,
+        timers: &mut VecDeque<(Instant, usize)>,
+        registry: &mio::Registry,
+    ) -> Turned {
+        let turned = self.advance_state(index, phase, timers, registry);
+        // Ask for write readiness exactly while the socket is believed full.
+        let wanted = !self.flags.writable;
+        if wanted != self.armed
+            && !self.done
+            && let Some(socket) = self.socket()
+        {
+            let interest = if wanted {
+                Interest::READABLE | Interest::WRITABLE
+            } else {
+                Interest::READABLE
+            };
+            if let Err(error) =
+                registry.reregister(socket, Token(index), interest)
+            {
+                self.state = State::Idle;
+                phase.failed = true;
+                return self.finish(Some(error.into()));
+            }
+            self.armed = wanted;
+        }
+        turned
+    }
+
+    /// The socket of whatever connection this owner holds.
+    fn socket(&mut self) -> Option<&mut TcpStream> {
+        match &mut self.state {
+            State::Idle => None,
+            State::Setup(setup) => Some(match &mut setup.stage {
+                Stage::Connecting(stream) => stream,
+                #[cfg(feature = "tls")]
+                Stage::Securing(secure) => secure.socket(),
+            }),
+            State::Open(connection) | State::Retiring(connection, _) => {
+                Some(connection.socket())
+            }
+        }
+    }
+
+    fn advance_state(
         &mut self,
         index: usize,
         phase: &mut Phase<'_>,

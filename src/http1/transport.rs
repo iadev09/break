@@ -309,6 +309,10 @@ pub(crate) mod secure {
             Ok(true)
         }
 
+        pub(in crate::http1) fn socket(&mut self) -> &mut S {
+            &mut self.stream
+        }
+
         pub(in crate::http1) fn negotiated(&self) -> Option<crate::Negotiated> {
             Some(crate::Negotiated {
                 version: self.session.protocol_version()?.as_str()?,
