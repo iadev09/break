@@ -50,6 +50,10 @@ Exit codes: `0` Done, `1` Broken, `2` argument parsing errors, `130` Ctrl-C.
 - `--max`: optional per-connection ceiling. Without it there is no fixed final
   phase. Reaching it reports tested load, not a server breakpoint.
 - `--expect-body`: additionally require an exact response body.
+- `--connect`: connect to this address instead of resolving the URL's host. The
+  URL still supplies the `Host` header and, for `https://`, the server name.
+- `--cacert`: for `https://`, trust the authorities in this PEM file instead of
+  the platform's.
 
 Phase zero targets `conn × start` requests. Phase `n` targets
 `conn × (start + n × pace)`. A completed request frees one slot and immediately
@@ -58,13 +62,25 @@ per phase; pending requests retain their original phase and deadline during drai
 There is no warmup, scenario-file loader or thread-count flag. CPU workers are
 selected automatically from available parallelism and the connection count.
 
-The initial adapter implements plain HTTP/1.1 GET with actual pipelining on each
-connection. It reads ordered responses while filling free request slots, reuses
-connections across phases, and validates complete bodies without text decoding.
+The adapter implements HTTP/1.1 GET with actual pipelining on each connection.
+It reads ordered responses while filling free request slots, reuses connections
+across phases, and validates complete bodies without text decoding.
 Content-Length, chunked and close-delimited bodies are supported. Unsupported or
-ambiguous framing is an explicit error. There are no TLS or protocol-selection
-flags. Pipelined outstanding requests are a client-side measure, not a claim that
-all server handlers execute simultaneously.
+ambiguous framing is an explicit error. Pipelined outstanding requests are a
+client-side measure, not a claim that all server handlers execute simultaneously.
+
+The URL's scheme selects the transport: `http://` is TCP, `https://` is TLS on the
+same connection model, with the same pipelining and the same outcomes. There is
+no protocol-selection flag. The handshake belongs to connection setup: it counts
+against the first request's deadline, and a certificate that does not verify is a
+setup failure, never a measured request. Verification is always on. A connection
+that ends without a TLS close is a transport failure, not a complete body. The
+`tls` feature is enabled by default; a build without it accepts `http://` only.
+
+```sh
+brk https://example.test/plain --connect 127.0.0.1:8443 --cacert authority.pem \
+  --conn 64 --start 2 --pace 2 --phase 10s --timeout 16ms
+```
 
 `Done` means the declared ceiling was completed. `Broken` retains the reason,
 last tested phase, last accepted phase and counters. Acceptance failure is distinct

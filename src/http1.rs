@@ -1,5 +1,6 @@
 mod connection;
 mod decode;
+mod transport;
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -11,11 +12,17 @@ use crate::{BreakReason, Counts};
 pub(crate) use connection::{Connection, Window, run_slot};
 
 /// One GET target and optional exact response validation.
+///
+/// An `http://` URL is requested over TCP, an `https://` URL over TLS on the
+/// same connection model. Nothing else about a run depends on the scheme.
 #[derive(Clone, Debug)]
 pub struct Target {
     uri: Uri,
     status: Option<StatusCode>,
     body: Option<Bytes>,
+    connect: Option<SocketAddr>,
+    #[cfg(feature = "tls")]
+    trust: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
 }
 
 impl Target {
@@ -23,10 +30,15 @@ impl Target {
         let uri: Uri = url
             .parse()
             .map_err(|_| BreakReason::Invalid("invalid target URL"))?;
-        if uri.scheme_str() != Some("http") || uri.host().is_none() {
-            return Err(BreakReason::Invalid(
-                "this adapter requires an absolute http:// URL",
-            ));
+        let scheme = uri.scheme_str();
+        let supported = scheme == Some("http")
+            || (scheme == Some("https") && cfg!(feature = "tls"));
+        if !supported || uri.host().is_none() {
+            return Err(BreakReason::Invalid(if cfg!(feature = "tls") {
+                "this adapter requires an absolute http:// or https:// URL"
+            } else {
+                "this build requires an absolute http:// URL"
+            }));
         }
         let authority = uri
             .authority()
@@ -47,7 +59,89 @@ impl Target {
         {
             return Err(BreakReason::Invalid("invalid target host or port"));
         }
-        Ok(Self { uri, status: None, body: None })
+        Ok(Self {
+            uri,
+            status: None,
+            body: None,
+            connect: None,
+            #[cfg(feature = "tls")]
+            trust: None,
+        })
+    }
+
+    /// Connect to this address instead of resolving the URL's host. The URL
+    /// still names the host: in the `Host` header and, over TLS, as the server
+    /// name the certificate must match.
+    pub fn connect_to(
+        mut self,
+        address: SocketAddr,
+    ) -> Self {
+        self.connect = Some(address);
+        self
+    }
+
+    /// For an `https://` target, trust exactly the authorities in this PEM
+    /// instead of the platform's.
+    #[cfg(feature = "tls")]
+    pub fn trust_pem(
+        mut self,
+        pem: &[u8],
+    ) -> Result<Self, BreakReason> {
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+
+        let authorities = CertificateDer::pem_slice_iter(pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| BreakReason::Invalid("invalid trust PEM"))?;
+        if authorities.is_empty() {
+            return Err(BreakReason::Invalid(
+                "the trust PEM holds no certificate",
+            ));
+        }
+        self.trust = Some(authorities);
+        Ok(self)
+    }
+
+    /// What every connection to an `https://` target presents and verifies.
+    #[cfg(feature = "tls")]
+    fn tls(
+        &self,
+        host: &str,
+    ) -> Result<transport::secure::Tls, BreakReason> {
+        let mut roots = rustls::RootCertStore::empty();
+        match &self.trust {
+            Some(authorities) => {
+                for authority in authorities {
+                    roots.add(authority.clone()).map_err(|_| {
+                        BreakReason::Invalid(
+                            "a trusted authority is not a usable certificate",
+                        )
+                    })?;
+                }
+            }
+            None => {
+                let platform = rustls_native_certs::load_native_certs();
+                roots.add_parsable_certificates(platform.certs);
+                if roots.is_empty() {
+                    return Err(BreakReason::Invalid(
+                        "no platform trust roots; name the authority to trust",
+                    ));
+                }
+            }
+        }
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| BreakReason::Invalid("no usable TLS protocol version"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let name = rustls::pki_types::ServerName::try_from(host.to_owned())
+            .map_err(|_| {
+                BreakReason::Invalid("target host is not a TLS server name")
+            })?;
+        Ok(transport::secure::Tls { config: Arc::new(config), name })
     }
 
     pub fn expect_status(
@@ -73,14 +167,17 @@ impl Target {
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(host);
-        let addresses: Arc<[SocketAddr]> =
-            (host, self.uri.port_u16().unwrap_or(80))
-                .to_socket_addrs()?
-                .collect::<Vec<_>>()
-                .into();
+        let secure = self.uri.scheme_str() == Some("https");
+        let port = self.uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
+        let addresses: Arc<[SocketAddr]> = match self.connect {
+            Some(address) => [address].into(),
+            None => (host, port).to_socket_addrs()?.collect::<Vec<_>>().into(),
+        };
         if addresses.is_empty() {
             return Err(BreakReason::Invalid("host resolved to no addresses"));
         }
+        #[cfg(feature = "tls")]
+        let tls = secure.then(|| self.tls(host)).transpose()?;
         let path = self.uri.path_and_query().map_or("/", |path| path.as_str());
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: {}\r\n\r\n",
@@ -91,6 +188,8 @@ impl Target {
             request: request.into_bytes(),
             status: self.status,
             body: self.body.clone(),
+            #[cfg(feature = "tls")]
+            tls,
         })
     }
 }
@@ -100,6 +199,8 @@ pub(crate) struct Prepared {
     request: Vec<u8>,
     status: Option<StatusCode>,
     body: Option<Bytes>,
+    #[cfg(feature = "tls")]
+    tls: Option<transport::secure::Tls>,
 }
 
 impl Prepared {
@@ -109,6 +210,8 @@ impl Prepared {
             request: self.request.clone().into_boxed_slice(),
             status: self.status,
             body: self.body.clone(),
+            #[cfg(feature = "tls")]
+            tls: self.tls.clone(),
         }
     }
 }
@@ -118,6 +221,8 @@ pub(crate) struct Client {
     request: Box<[u8]>,
     status: Option<StatusCode>,
     body: Option<Bytes>,
+    #[cfg(feature = "tls")]
+    tls: Option<transport::secure::Tls>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,7 +279,6 @@ mod tests {
         for invalid in [
             "",
             "/plain",
-            "https://example.test",
             "http:///",
             "ftp://example.test",
             "http://user:pass@example.test",
@@ -186,6 +290,10 @@ mod tests {
             assert!(Target::new(invalid).is_err(), "{invalid}");
         }
         assert!(Target::new("http://[::1]:8080/plain?q=1").is_ok());
+        assert_eq!(
+            Target::new("https://example.test").is_ok(),
+            cfg!(feature = "tls")
+        );
     }
 
     #[cfg(unix)]

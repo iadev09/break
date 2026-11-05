@@ -7,6 +7,7 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 use super::decode::Decoder;
+use super::transport::Transport;
 use super::{Client, Outcome, is_local_resource};
 use crate::load::Meter;
 use crate::{BreakReason, Counts, LatencyStats, LoadStats};
@@ -51,7 +52,7 @@ impl Attempt {
 }
 
 pub(crate) struct Connection {
-    stream: TcpStream,
+    stream: Transport,
     decoder: Decoder,
     pending: VecDeque<Attempt>,
     buffer: Vec<u8>,
@@ -74,11 +75,16 @@ impl Connection {
         let deadline = Instant::now() + timeout;
         let stream = tokio::select! {
             _ = stop.cancelled() => return Err(BreakReason::Cancelled),
-            result = tokio::time::timeout_at(deadline.into(), TcpStream::connect(client.addresses.as_ref())) => {
+            result = tokio::time::timeout_at(deadline.into(), async {
+                let stream =
+                    TcpStream::connect(client.addresses.as_ref()).await?;
+                stream.set_nodelay(true)?;
+                // An `https://` target is connected once its handshake is done.
+                Transport::open(stream, client).await
+            }) => {
                 result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection deadline exceeded"))??
             }
         };
-        stream.set_nodelay(true)?;
         let mut buffer = Vec::new();
         // This is an I/O chunk, not a response-size or request-concurrency limit.
         buffer

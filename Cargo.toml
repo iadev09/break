@@ -19,20 +19,31 @@ name = "brk"
 name = "http1"
 path = "tests/http1.rs"
 
+[[test]]
+name = "tls"
+path = "tests/tls.rs"
+required-features = ["tls"]
+
 [[bin]]
 name = "brk"
 path = "src/bin/brk.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli"]
+default = ["cli", "tls"]
 cli = ["dep:clap", "dep:ctrlc", "dep:humantime"]
+# `https://` targets: HTTP/1.1 over TLS, with the same pipelining.
+tls = ["dep:rustls", "dep:rustls-native-certs"]
 
 [dependencies]
 # HTTP/1 transport
 bytes = "1"
 http = "1"
 httparse = "1"
+
+# Optional TLS transport
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 # Executor and asynchronous operations
 futures-util = "0.3"
@@ -47,6 +58,10 @@ humantime = { version = "2", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# A throwaway certificate for the TLS fixture.
+rcgen = "0.14"
 
 [profile.release]
 opt-level = 3

@@ -36,6 +36,13 @@
   enter the load integral; complete responses or retirement leave it. Expired
   attempts, direct transport failures and unexpired abandoned followers remain
   distinct failed outcomes. TCP setup failures are counted separately.
+- `src/http1/transport.rs`: what carries a connection's bytes. A TCP stream, or
+  the same stream under TLS for an `https://` target (`tls` feature). Both expose
+  socket readiness and non-blocking reads and writes, so the connection loop does
+  not know which it drives. The TLS session is driven directly on that readiness:
+  records already owed are written before new request bytes are accepted, and
+  decrypted bytes still held by the session are reported readable without
+  waiting for the socket. The handshake completes inside connection setup.
 - `src/http1/decode.rs`: incremental response framing with httparse. Handles
   interim responses, Content-Length, chunked/trailers, close-delimited bodies and
   coalesced/fragmented replies. Payload bytes are checked in place. Ambiguous or
@@ -67,8 +74,8 @@ admission and joins its threads, including during callback unwinding.
 - `src/cli.rs`: arguments, Ctrl-C ownership and phase/result output.
 - `src/bin/brk.rs`: CLI entry point.
 
-Initial transport: plain HTTP/1.1 GET. No TLS, protocol selector, warmup or scenario
-loader is advertised. Concurrency is outstanding client work, not server-handler
+Transport: HTTP/1.1 GET over TCP or, selected by an `https://` URL, over TLS. No
+protocol selector, warmup or scenario loader is advertised. Concurrency is outstanding client work, not server-handler
 parallelism. Protocol-specific scheduling does not change the phase contract.
 
 ## Tests
@@ -85,6 +92,9 @@ parallelism. Protocol-specific scheduling does not change the phase contract.
 - `src/http1.rs`: URL and client-resource classification.
 - `src/http1/decode.rs`: arbitrary fragmentation, interim/chunked/pipelined
   responses, invalid framing and dynamically sized header fields.
+- `tests/tls.rs`: a real TLS listener: pipelining inside records at shallow and
+  deep depth, the URL's host on the wire with `connect_to`, and an untrusted
+  authority failing setup instead of counting as load.
 - `src/cli.rs`: numeric load controls and unsupported-option rejection.
 - `tests/http1.rs`: real ephemeral TCP fixtures; fixed connections and growing
   pipelines, callback ordering, per-phase counters, body/deadline failures,

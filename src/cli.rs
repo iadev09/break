@@ -16,8 +16,17 @@ use clap::Parser;
     about = env!("CARGO_PKG_DESCRIPTION")
 )]
 struct Args {
-    /// HTTP URL to test.
+    /// URL to test: http:// over TCP, https:// over TLS.
     url: String,
+    /// Connect to this address instead of resolving the URL's host. The URL
+    /// still supplies the Host header and the TLS server name.
+    #[arg(long, value_name = "ADDRESS")]
+    connect: Option<std::net::SocketAddr>,
+    /// For https://, trust the authorities in this PEM file instead of the
+    /// platform's.
+    #[cfg(feature = "tls")]
+    #[arg(long, value_name = "FILE")]
+    cacert: Option<std::path::PathBuf>,
     /// Fixed number of connections.
     #[arg(long)]
     conn: usize,
@@ -114,6 +123,15 @@ fn print_boundary(stats: &Stats) {
 fn execute(args: Args) -> Result<crate::Done, Broken> {
     let setup_error = |reason| Broken { reason, stats: Box::default() };
     let mut target = Target::new(&args.url).map_err(setup_error)?;
+    if let Some(address) = args.connect {
+        target = target.connect_to(address);
+    }
+    #[cfg(feature = "tls")]
+    if let Some(path) = &args.cacert {
+        let pem = std::fs::read(path)
+            .map_err(|error| setup_error(BreakReason::Io(error)))?;
+        target = target.trust_pem(&pem).map_err(setup_error)?;
+    }
     if let Some(body) = args.expect_body {
         target = target.expect_body(body.into_bytes());
     }
