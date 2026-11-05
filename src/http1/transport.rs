@@ -9,6 +9,23 @@ use tokio::net::TcpStream;
 
 use super::Client;
 
+/// One owner's TLS sessions: what a single visitor remembers of the server.
+#[cfg(feature = "tls")]
+pub(crate) type Sessions = secure::Tls;
+#[cfg(not(feature = "tls"))]
+pub(crate) type Sessions = std::convert::Infallible;
+
+/// The TLS sessions of one owner, when the target is `https://`.
+pub(crate) fn own_sessions(client: &Client) -> Option<Sessions> {
+    #[cfg(feature = "tls")]
+    return client.tls.as_ref().map(secure::Tls::visitor);
+    #[cfg(not(feature = "tls"))]
+    {
+        let _ = client;
+        None
+    }
+}
+
 pub(crate) enum Transport {
     Plain(TcpStream),
     #[cfg(feature = "tls")]
@@ -17,19 +34,30 @@ pub(crate) enum Transport {
 
 impl Transport {
     /// Take an established TCP stream and, for an `https://` target, complete
-    /// the TLS handshake on it. The caller's deadline covers both.
+    /// the TLS handshake on it. The caller's deadline covers both. `sessions`
+    /// replaces the target's shared TLS sessions with one owner's own.
     pub(crate) async fn open(
         stream: TcpStream,
         client: &Client,
+        sessions: Option<&Sessions>,
     ) -> io::Result<Self> {
         #[cfg(feature = "tls")]
-        if let Some(tls) = &client.tls {
+        if let Some(tls) = sessions.or(client.tls.as_ref()) {
             return Ok(Self::Tls(Box::new(
                 secure::Secure::handshake(stream, tls).await?,
             )));
         }
-        let _ = client;
+        let _ = (client, sessions);
         Ok(Self::Plain(stream))
+    }
+
+    /// Whether this connection's TLS handshake resumed an earlier session.
+    pub(crate) fn resumed(&self) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            #[cfg(feature = "tls")]
+            Self::Tls(secure) => secure.resumed(),
+        }
     }
 
     pub(crate) async fn ready(
@@ -80,6 +108,25 @@ pub(crate) mod secure {
     pub(crate) struct Tls {
         pub(crate) config: Arc<rustls::ClientConfig>,
         pub(crate) name: ServerName<'static>,
+        pub(crate) resume: bool,
+    }
+
+    impl Tls {
+        /// The same client with a session memory of its own, holding this
+        /// one server. A store shared by every owner would let each resume
+        /// the newest session and hide how many the server has to keep.
+        pub(crate) fn visitor(&self) -> Self {
+            let mut config = (*self.config).clone();
+            if self.resume {
+                config.resumption =
+                    rustls::client::Resumption::in_memory_sessions(1);
+            }
+            Self {
+                config: Arc::new(config),
+                name: self.name.clone(),
+                resume: self.resume,
+            }
+        }
     }
 
     /// The socket as the TLS session reads and writes it: without blocking.
@@ -150,6 +197,13 @@ pub(crate) mod secure {
             }
             secure.flush()?;
             Ok(secure)
+        }
+
+        pub(super) fn resumed(&self) -> bool {
+            matches!(
+                self.session.handshake_kind(),
+                Some(rustls::HandshakeKind::Resumed)
+            )
         }
 
         /// Move received TLS records into the session.

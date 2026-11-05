@@ -3,10 +3,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
-use crate::worker::{Command, Workers, receive};
+use crate::worker::{Churn, Command, Workers, receive};
 use crate::{
     Acceptance, BreakReason, Broken, CancellationToken, Counts, Done,
-    LatencyStats, LoadStats, Observer, Phase, PhaseStats, Stats, Target,
+    LatencyStats, LoadStats, Observer, Phase, PhaseStats, Setups, Stats,
+    Target,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -28,24 +29,104 @@ impl Plan {
                 "conn, start and pace must be greater than zero",
             ));
         }
+        self.conn.checked_mul(self.start).ok_or(BreakReason::Overflow)?;
+        self.ramp().validate(self.accept)
+    }
+
+    fn ramp(&self) -> Ramp {
+        Ramp {
+            raises: Raises::Depth { connections: self.conn },
+            start: self.start,
+            pace: self.pace,
+            max: self.max_concurrency,
+            phase_duration: self.phase_duration,
+            timeout: self.timeout,
+        }
+    }
+}
+
+/// The connection test. Each owner establishes a connection, sends exactly
+/// `requests` requests one at a time, lets the connection end and establishes
+/// the next. Phases raise the number of owners; setups are judged on their own.
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectionPlan {
+    /// Connection owners in phase zero.
+    pub start: usize,
+    /// Additional owners in each later phase.
+    pub pace: usize,
+    /// Exact number of requests each connection carries.
+    pub requests: usize,
+    pub phase_duration: Duration,
+    /// Deadline of a setup, and separately of each request.
+    pub timeout: Duration,
+    pub accept: f64,
+    /// Optional ceiling on owners; it does not assert a server breakpoint.
+    pub max_owners: Option<usize>,
+}
+
+impl ConnectionPlan {
+    pub fn validate(&self) -> Result<Acceptance, BreakReason> {
+        if self.start == 0 || self.pace == 0 || self.requests == 0 {
+            return Err(BreakReason::Invalid(
+                "start, pace and requests must be greater than zero",
+            ));
+        }
+        self.ramp().validate(self.accept)
+    }
+
+    fn ramp(&self) -> Ramp {
+        Ramp {
+            raises: Raises::Owners { requests: self.requests },
+            start: self.start,
+            pace: self.pace,
+            max: self.max_owners,
+            phase_duration: self.phase_duration,
+            timeout: self.timeout,
+        }
+    }
+}
+
+/// What each phase raises, and what stays fixed beside it.
+#[derive(Clone, Copy)]
+enum Raises {
+    /// Requests per connection, over connections that stay open.
+    Depth { connections: usize },
+    /// Connection owners, each connection carrying a fixed number of requests.
+    Owners { requests: usize },
+}
+
+#[derive(Clone, Copy)]
+struct Ramp {
+    raises: Raises,
+    start: usize,
+    pace: usize,
+    max: Option<usize>,
+    phase_duration: Duration,
+    timeout: Duration,
+}
+
+impl Ramp {
+    fn validate(
+        &self,
+        accept: f64,
+    ) -> Result<Acceptance, BreakReason> {
         if self.phase_duration.is_zero() || self.timeout.is_zero() {
             return Err(BreakReason::Invalid(
                 "phase and timeout must be greater than zero",
             ));
         }
-        if self.max_concurrency.is_some_and(|max| max < self.start) {
+        if self.max.is_some_and(|max| max < self.start) {
             return Err(BreakReason::Invalid(
                 "max must admit the initial start level",
             ));
         }
-        self.conn.checked_mul(self.start).ok_or(BreakReason::Overflow)?;
         Instant::now()
             .checked_add(self.phase_duration)
             .and_then(|end| end.checked_add(self.timeout))
             .ok_or(BreakReason::Invalid(
                 "time budgets exceed the clock range",
             ))?;
-        Acceptance::try_from(self.accept).map_err(BreakReason::Invalid)
+        Acceptance::try_from(accept).map_err(BreakReason::Invalid)
     }
 }
 
@@ -58,8 +139,31 @@ pub fn run(
     cancellation: &CancellationToken,
     observer: &mut (impl Observer + ?Sized),
 ) -> Result<Done, Broken> {
+    finish(plan.validate(), plan.ramp(), target, cancellation, observer)
+}
+
+/// The connection test, with the same ownership and callbacks as [`run`].
+/// A phase is accepted when both its setups and its requests are.
+pub fn run_connections(
+    target: &Target,
+    plan: ConnectionPlan,
+    cancellation: &CancellationToken,
+    observer: &mut (impl Observer + ?Sized),
+) -> Result<Done, Broken> {
+    finish(plan.validate(), plan.ramp(), target, cancellation, observer)
+}
+
+fn finish(
+    acceptance: Result<Acceptance, BreakReason>,
+    ramp: Ramp,
+    target: &Target,
+    cancellation: &CancellationToken,
+    observer: &mut (impl Observer + ?Sized),
+) -> Result<Done, Broken> {
     let mut stats = Stats::default();
-    let result = execute(target, plan, cancellation, observer, &mut stats);
+    let result = acceptance.and_then(|acceptance| {
+        execute(target, ramp, acceptance, cancellation, observer, &mut stats)
+    });
     match result {
         Ok(()) => Ok(Done { stats }),
         Err(reason) => Err(Broken { reason, stats: Box::new(stats) }),
@@ -68,27 +172,33 @@ pub fn run(
 
 fn execute(
     target: &Target,
-    plan: Plan,
+    ramp: Ramp,
+    acceptance: Acceptance,
     cancellation: &CancellationToken,
     observer: &mut (impl Observer + ?Sized),
     stats: &mut Stats,
 ) -> Result<(), BreakReason> {
-    let acceptance = plan.validate()?;
     if cancellation.is_cancelled() {
         return Err(BreakReason::Cancelled);
     }
     let prepared = target.resolve()?;
     let stop = cancellation.child_token();
-    let workers = Workers::start(&prepared, plan.conn, stop.clone())?;
+    // Kept connections belong to the request test. The connection test's
+    // owners are bounded only by its ceiling, when one is declared.
+    let (owners, kept) = match ramp.raises {
+        Raises::Depth { connections } => (connections, connections),
+        Raises::Owners { .. } => (ramp.max.unwrap_or(usize::MAX), 0),
+    };
+    let workers = Workers::start(&prepared, owners, kept, stop.clone())?;
     stats.cpu_workers = workers.len();
-    let result = phases(&workers, plan, acceptance, &stop, observer, stats);
+    let result = phases(&workers, ramp, acceptance, &stop, observer, stats);
     let finished = workers.finish();
     result.and(finished)
 }
 
 fn phases(
     workers: &Workers,
-    plan: Plan,
+    plan: Ramp,
     acceptance: Acceptance,
     stop: &CancellationToken,
     observer: &mut (impl Observer + ?Sized),
@@ -100,13 +210,17 @@ fn phases(
         if stop.is_cancelled() {
             return Err(BreakReason::Cancelled);
         }
+        let (connections, depth, lifetime) = match plan.raises {
+            Raises::Depth { connections } => (connections, level, None),
+            // One request at a time: pipeline depth is the request test's.
+            Raises::Owners { requests } => (level, 1, Some(requests)),
+        };
         let phase = Phase {
             index,
-            connections: plan.conn,
-            requests_per_connection: level,
-            total_concurrency: plan
-                .conn
-                .checked_mul(level)
+            connections,
+            requests_per_connection: depth,
+            total_concurrency: connections
+                .checked_mul(depth)
                 .ok_or(BreakReason::Overflow)?,
             duration: plan.phase_duration,
         };
@@ -134,6 +248,11 @@ fn phases(
                 worker,
                 Command {
                     phase,
+                    churn: lifetime.map(|requests| Churn {
+                        owners: connections / workers.len()
+                            + usize::from(worker < connections % workers.len()),
+                        requests,
+                    }),
                     timeout: plan.timeout,
                     start: waiting.clone(),
                     phase_stop: phase_stop.clone(),
@@ -155,9 +274,11 @@ fn phases(
         let mut failure = None;
         let mut load = LoadStats::default();
         let mut latency = LatencyStats::default();
+        let mut setups = Setups::default();
         for reply in replies {
             match receive(reply) {
                 Ok(summary) => {
+                    setups.add(summary.setups);
                     counts.add(summary.counts);
                     at_target += summary.at_target;
                     load.add(summary.load);
@@ -179,6 +300,7 @@ fn phases(
             connections_at_target: at_target,
             load,
             latency,
+            setups: lifetime.map(|_| setups),
             completed: failure.is_none() && !stop.is_cancelled(),
             cancelled: stop.is_cancelled(),
         };
@@ -192,8 +314,11 @@ fn phases(
         if measured.cancelled {
             return Err(BreakReason::Cancelled);
         }
-        if at_target != plan.conn {
-            return Err(BreakReason::Unfulfilled);
+        if !measured.connections_accepted(acceptance) {
+            return Err(match plan.raises {
+                Raises::Depth { .. } => BreakReason::Unfulfilled,
+                Raises::Owners { .. } => BreakReason::Connections,
+            });
         }
         if !measured.accepted(acceptance) {
             return Err(BreakReason::Acceptance);
@@ -202,11 +327,11 @@ fn phases(
         if stop.is_cancelled() {
             return Err(BreakReason::Cancelled);
         }
-        if plan.max_concurrency == Some(level) {
+        if plan.max == Some(level) {
             return Ok(());
         }
         let next = level.checked_add(plan.pace).ok_or(BreakReason::Overflow)?;
-        level = plan.max_concurrency.map_or(next, |max| next.min(max));
+        level = plan.max.map_or(next, |max| next.min(max));
         index = index.checked_add(1).ok_or(BreakReason::Overflow)?;
     }
 }

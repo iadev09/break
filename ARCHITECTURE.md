@@ -48,6 +48,30 @@
   coalesced/fragmented replies. Payload bytes are checked in place. Ambiguous or
   unsupported framing fails explicitly; header-field storage grows as needed.
 
+## Two tests, one phase loop
+
+`run` is the request test and `run_connections` the connection test. Both
+enter the same phase loop with a ramp that names what is raised: requests per
+connection over connections that stay open, or connection owners whose
+connections each carry a fixed number of requests. Nothing else differs in how
+phases start, drain and report.
+
+In the connection test a connection has a lifetime: it admits its declared
+requests one at a time, sends the last with `Connection: close`, and once that
+is answered waits for the peer to close before its owner establishes the next.
+Setups are counted in `Setups`, apart from `Counts`: a setup that fails is
+that test's outcome and the owner tries again, where in the request test it
+ends the phase as a setup error. A setup has the declared timeout as its own
+deadline, and the first request's budget starts when it is written. Workers
+keep no connection across phases; each phase tells a worker how many owners it
+runs. Over TLS every owner has its own session memory for the phase, so a
+resumed handshake means the server remembered that visitor.
+
+A phase of the connection test is accepted when its setups meet the acceptance
+budget and its requests do; `BreakReason::Connections` and
+`BreakReason::Acceptance` say which did not. The request test's `Unfulfilled`
+check does not apply: there is no pipeline depth to establish.
+
 ## Phase ownership
 
 Workers acknowledge readiness, then wait. The caller invokes `phase_started`,
@@ -93,8 +117,14 @@ parallelism. Protocol-specific scheduling does not change the phase contract.
 - `src/http1/decode.rs`: arbitrary fragmentation, interim/chunked/pipelined
   responses, invalid framing and dynamically sized header fields.
 - `tests/tls.rs`: a real TLS listener: pipelining inside records at shallow and
-  deep depth, the URL's host on the wire with `connect_to`, and an untrusted
-  authority failing setup instead of counting as load.
+  deep depth, the URL's host on the wire with `connect_to`, an untrusted
+  authority failing setup instead of counting as load, and an owner resuming
+  its own session unless resumption is declined.
+- `tests/connections.rs`: the connection test against a real listener: each
+  connection carries its declared requests, asks to close on the last and is
+  replaced; a refused setup breaks the connection contract and counts no
+  request.
+- `tests/cli.rs`: the two tests' names, short forms and separate options.
 - `src/cli.rs`: numeric load controls and unsupported-option rejection.
 - `tests/http1.rs`: real ephemeral TCP fixtures; fixed connections and growing
   pipelines, callback ordering, per-phase counters, body/deadline failures,

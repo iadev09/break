@@ -24,6 +24,10 @@ name = "tls"
 path = "tests/tls.rs"
 required-features = ["tls"]
 
+[[test]]
+name = "connections"
+path = "tests/connections.rs"
+
 [[bin]]
 name = "brk"
 path = "src/bin/brk.rs"

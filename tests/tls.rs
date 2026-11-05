@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use brk::{CancellationToken, Plan, Target};
+use brk::{CancellationToken, ConnectionPlan, Plan, Target};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 const NAME: &str = "example.test";
@@ -177,4 +177,40 @@ fn an_untrusted_authority_fails_setup_instead_of_counting_as_load() {
     assert!(broken.connection_failed());
     assert_eq!(broken.stats.total.successful, 0);
     assert_eq!(fixture.requests.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn a_returning_owner_resumes_its_own_session_unless_told_not_to() {
+    for resume in [true, false] {
+        let fixture = Fixture::new();
+        let target =
+            fixture.target().trust_pem(fixture.authority.as_bytes()).unwrap();
+        let target = if resume { target } else { target.without_resumption() };
+        let plan = ConnectionPlan {
+            start: 2,
+            pace: 2,
+            requests: 1,
+            phase_duration: Duration::from_millis(100),
+            timeout: Duration::from_secs(2),
+            accept: 99.99,
+            max_owners: Some(2),
+        };
+        let done = brk::run_connections(
+            &target,
+            plan,
+            &CancellationToken::new(),
+            &mut (),
+        )
+        .unwrap();
+        let setups = done.stats.last_accepted.unwrap().setups.unwrap();
+        assert!(setups.established > 2, "{resume}");
+        assert_eq!(done.stats.total.failed(), 0, "{resume}");
+        if resume {
+            // Each of the two owners has nothing to resume the first time.
+            assert!(setups.resumed > 0);
+            assert!(setups.resumed <= setups.established - 2);
+        } else {
+            assert_eq!(setups.resumed, 0);
+        }
+    }
 }

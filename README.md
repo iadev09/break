@@ -82,6 +82,51 @@ brk https://example.test/plain --connect 127.0.0.1:8443 --cacert authority.pem \
   --conn 64 --start 2 --pace 2 --phase 10s --timeout 16ms
 ```
 
+## Two tests
+
+`brk` has two tests. Each raises one thing and judges one contract, and they
+are run separately.
+
+| Test | Stays fixed | Raised each phase | Decides a phase |
+| --- | --- | --- | --- |
+| `brk requests` (`req`, the default) | connections, kept open | concurrent requests per connection | request outcomes |
+| `brk connections` (`conn`) | requests per connection | concurrent connections | connection outcomes, then request outcomes |
+
+Everything above describes the request test: connections are opened once, and
+a setup that fails there is a setup error that claims nothing about capacity.
+
+In the connection test, establishing a connection is the measured work:
+
+```sh
+brk conn https://example.test/plain --start 64 --pace 64 --requests 1 \
+  --phase 10s --timeout 100ms
+```
+
+- `--start`, `--pace`, `--max`: concurrent connections, not requests.
+- `--requests`: the exact number of requests each connection carries, written
+  one at a time. Pipeline depth is the request test's subject.
+- `--no-resume`: for `https://`, make every handshake a full one.
+
+Each connection is established, carries its requests and ends; its owner then
+establishes the next one, with no delay. A setup is the connect call through
+the end of the TLS handshake and has the declared `--timeout` as its own
+deadline; each request's deadline starts when it is written. Setups are
+counted apart from requests: attempted, established, failed, timed out. A phase
+is accepted when the established share meets `--accept` and the requests do
+too, and a break names which of the two it was.
+
+The client asks to close with `Connection: close` on a connection's last
+request and waits for the server to close. Ending the connection is then the
+server's work, as it is with real clients that are told to go away, and the
+closing wait state does not pile up on the client's local ports. Running out
+of local ports or descriptors is a client failure and claims nothing about the
+server.
+
+Over TLS each connection owner is one visitor with its own session memory.
+Sessions are resumed by default, as returning clients do; each phase reports
+how many established connections resumed. A server whose session cache does
+not serve a returning visitor shows up as full handshakes.
+
 `Done` means the declared ceiling was completed. `Broken` retains the reason,
 last tested phase, last accepted phase and counters. Acceptance failure is distinct
 from client I/O/resource failure, invalid protocol data or an unfulfilled target.

@@ -1,12 +1,13 @@
 //! Command-line adapter; the library itself installs no process signal handler.
+use std::ffi::OsString;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::{
-    Acceptance, BreakReason, Broken, CancellationToken, Observer, Phase,
-    PhaseStats, Plan, Stats, Target,
+    Acceptance, BreakReason, Broken, CancellationToken, ConnectionPlan,
+    Observer, Phase, PhaseStats, Plan, Stats, Target,
 };
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -15,7 +16,26 @@ use clap::Parser;
     color = clap::ColorChoice::Never,
     about = env!("CARGO_PKG_DESCRIPTION")
 )]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    test: Test,
+}
+
+/// Two separate tests. Each raises one thing and judges one contract.
+#[derive(Subcommand)]
+enum Test {
+    /// Raise concurrent requests per connection over connections that stay
+    /// open. This is the default test.
+    #[command(alias = "req")]
+    Requests(RequestArgs),
+    /// Raise concurrent connections, each carrying a fixed number of
+    /// requests before it is replaced.
+    #[command(alias = "conn")]
+    Connections(ConnectionArgs),
+}
+
+#[derive(Args)]
+struct Common {
     /// URL to test: http:// over TCP, https:// over TLS.
     url: String,
     /// Connect to this address instead of resolving the URL's host. The URL
@@ -27,6 +47,30 @@ struct Args {
     #[cfg(feature = "tls")]
     #[arg(long, value_name = "FILE")]
     cacert: Option<std::path::PathBuf>,
+    /// For https://, make every handshake a full one instead of resuming.
+    #[cfg(feature = "tls")]
+    #[arg(long)]
+    no_resume: bool,
+    /// Time at each level, for example 10s.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    phase: Duration,
+    /// Request deadline. In the request test it includes setup for the first
+    /// request on a connection; in the connection test a setup has this
+    /// deadline of its own.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    timeout: Duration,
+    /// Minimum successful percentage within the deadline.
+    #[arg(long, alias = "sla", default_value_t = 99.99)]
+    accept: f64,
+    /// Additionally require this exact response body, without text decoding.
+    #[arg(long)]
+    expect_body: Option<String>,
+}
+
+#[derive(Args)]
+struct RequestArgs {
+    #[command(flatten)]
+    common: Common,
     /// Fixed number of connections.
     #[arg(long)]
     conn: usize,
@@ -36,38 +80,92 @@ struct Args {
     /// Additional concurrent requests per connection in each phase.
     #[arg(long)]
     pace: usize,
-    /// Time at each concurrency level, for example 10s.
-    #[arg(long, value_parser = humantime::parse_duration)]
-    phase: Duration,
-    /// Request deadline, including setup for the first request on a connection.
-    #[arg(long, value_parser = humantime::parse_duration)]
-    timeout: Duration,
-    /// Minimum successful 2xx percentage within the request deadline.
-    #[arg(long, alias = "sla", default_value_t = 99.99)]
-    accept: f64,
     /// Optional per-connection ceiling; reaching it does not find a breakpoint.
     #[arg(long = "max")]
     max_concurrency: Option<usize>,
-    /// Additionally require this exact response body, without text decoding.
+}
+
+#[derive(Args)]
+struct ConnectionArgs {
+    #[command(flatten)]
+    common: Common,
+    /// Initial concurrent connections; defaults to pace.
     #[arg(long)]
-    expect_body: Option<String>,
+    start: Option<usize>,
+    /// Additional concurrent connections in each phase.
+    #[arg(long)]
+    pace: usize,
+    /// Exact number of requests each connection carries, one at a time.
+    #[arg(long)]
+    requests: usize,
+    /// Optional ceiling on connections; reaching it does not find a breakpoint.
+    #[arg(long = "max")]
+    max_owners: Option<usize>,
+}
+
+/// `brk <url> ...` is the request test: the default needs no name.
+fn parse(
+    arguments: impl IntoIterator<Item = OsString>
+) -> Result<Cli, clap::Error> {
+    let mut arguments: Vec<OsString> = arguments.into_iter().collect();
+    let named = arguments.get(1).and_then(|first| first.to_str()).is_some_and(
+        |first| {
+            matches!(
+                first,
+                "requests"
+                    | "req"
+                    | "connections"
+                    | "conn"
+                    | "help"
+                    | "-h"
+                    | "--help"
+                    | "-V"
+                    | "--version"
+            )
+        },
+    );
+    if !named && arguments.len() > 1 {
+        arguments.insert(1, "requests".into());
+    }
+    Cli::try_parse_from(arguments)
+}
+
+/// What a level counts in each test's output.
+#[derive(Clone, Copy)]
+enum Unit {
+    Requests,
+    Connections,
+}
+
+impl Unit {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Requests => "concurrent requests",
+            Self::Connections => "concurrent connections",
+        }
+    }
 }
 
 pub fn main() -> ExitCode {
-    let args = Args::parse();
-    match execute(args) {
+    let cli = parse(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    let unit = match &cli.test {
+        Test::Requests(_) => Unit::Requests,
+        Test::Connections(_) => Unit::Connections,
+    };
+    match execute(cli.test) {
         Ok(done) => {
-            print_boundary(&done.stats);
+            print_boundary(&done.stats, unit);
             if let Some(last) = &done.stats.last_accepted {
                 println!(
-                    "Done ({} concurrent requests): tested ceiling completed; breakpoint not found.",
-                    last.phase.total_concurrency
+                    "Done ({} {}): tested ceiling completed; breakpoint not found.",
+                    last.phase.total_concurrency,
+                    unit.name()
                 );
             }
             ExitCode::SUCCESS
         }
         Err(broken) => {
-            print_boundary(&broken.stats);
+            print_boundary(&broken.stats, unit);
             let label = if matches!(broken.reason, BreakReason::Cancelled) {
                 "Cancelled"
             } else {
@@ -75,8 +173,10 @@ pub fn main() -> ExitCode {
             };
             if let Some(last) = &broken.stats.last_phase {
                 eprintln!(
-                    "{label} ({} concurrent requests): {}",
-                    last.phase.total_concurrency, broken.reason
+                    "{label} ({} {}): {}",
+                    last.phase.total_concurrency,
+                    unit.name(),
+                    broken.reason
                 );
             } else {
                 eprintln!("{label}: {}", broken.reason);
@@ -85,8 +185,10 @@ pub fn main() -> ExitCode {
                 eprintln!(
                     "Connection setup failed; this does not establish a client or server capacity limit."
                 );
-            } else if matches!(broken.reason, BreakReason::Acceptance)
-                && !broken.has_capacity_boundary()
+            } else if matches!(
+                broken.reason,
+                BreakReason::Acceptance | BreakReason::Connections
+            ) && !broken.has_capacity_boundary()
             {
                 eprintln!(
                     "Initial load rejected; no passing baseline was established."
@@ -103,91 +205,188 @@ pub fn main() -> ExitCode {
     }
 }
 
-fn print_boundary(stats: &Stats) {
-    if let Some(last) = &stats.last_accepted {
-        println!(
-            "Last accepted: {} requests/connection, {} total concurrent requests",
-            last.phase.requests_per_connection, last.phase.total_concurrency
-        );
-    }
-    if let Some(last) = &stats.last_phase {
-        println!(
-            "Last tested: phase {}, {} requests/connection, {} total concurrent requests",
-            last.phase.index,
-            last.phase.requests_per_connection,
-            last.phase.total_concurrency
-        );
+fn print_boundary(
+    stats: &Stats,
+    unit: Unit,
+) {
+    match unit {
+        Unit::Requests => {
+            if let Some(last) = &stats.last_accepted {
+                println!(
+                    "Last accepted: {} requests/connection, {} total concurrent requests",
+                    last.phase.requests_per_connection,
+                    last.phase.total_concurrency
+                );
+            }
+            if let Some(last) = &stats.last_phase {
+                println!(
+                    "Last tested: phase {}, {} requests/connection, {} total concurrent requests",
+                    last.phase.index,
+                    last.phase.requests_per_connection,
+                    last.phase.total_concurrency
+                );
+            }
+        }
+        Unit::Connections => {
+            if let Some(last) = &stats.last_accepted {
+                println!(
+                    "Last accepted: {} concurrent connections",
+                    last.phase.connections
+                );
+            }
+            if let Some(last) = &stats.last_phase {
+                println!(
+                    "Last tested: phase {}, {} concurrent connections",
+                    last.phase.index, last.phase.connections
+                );
+            }
+        }
     }
 }
 
-fn execute(args: Args) -> Result<crate::Done, Broken> {
-    let setup_error = |reason| Broken { reason, stats: Box::default() };
-    let mut target = Target::new(&args.url).map_err(setup_error)?;
-    if let Some(address) = args.connect {
+fn target(common: &Common) -> Result<Target, BreakReason> {
+    let mut target = Target::new(&common.url)?;
+    if let Some(address) = common.connect {
         target = target.connect_to(address);
     }
     #[cfg(feature = "tls")]
-    if let Some(path) = &args.cacert {
-        let pem = std::fs::read(path)
-            .map_err(|error| setup_error(BreakReason::Io(error)))?;
-        target = target.trust_pem(&pem).map_err(setup_error)?;
+    {
+        if let Some(path) = &common.cacert {
+            target = target.trust_pem(&std::fs::read(path)?)?;
+        }
+        if common.no_resume {
+            target = target.without_resumption();
+        }
     }
-    if let Some(body) = args.expect_body {
-        target = target.expect_body(body.into_bytes());
+    if let Some(body) = &common.expect_body {
+        target = target.expect_body(body.clone().into_bytes());
     }
-    let plan = Plan {
-        conn: args.conn,
-        start: args.start.unwrap_or(args.pace),
-        pace: args.pace,
-        phase_duration: args.phase,
-        timeout: args.timeout,
-        accept: args.accept,
-        max_concurrency: args.max_concurrency,
-    };
-    let acceptance = plan.validate().map_err(setup_error)?;
-    let stop = CancellationToken::new();
-    let signal = stop.clone();
-    ctrlc::set_handler(move || signal.cancel()).map_err(|_| {
-        setup_error(BreakReason::Worker("could not install Ctrl-C handler"))
-    })?;
-    crate::run(&target, plan, &stop, &mut Printer(acceptance))
+    Ok(target)
 }
 
-struct Printer(Acceptance);
+fn execute(test: Test) -> Result<crate::Done, Broken> {
+    let setup_error = |reason| Broken { reason, stats: Box::default() };
+    let stop = CancellationToken::new();
+    let signal = stop.clone();
+    let interrupt = || {
+        ctrlc::set_handler(move || signal.cancel()).map_err(|_| {
+            setup_error(BreakReason::Worker("could not install Ctrl-C handler"))
+        })
+    };
+    match test {
+        Test::Requests(args) => {
+            let target = target(&args.common).map_err(setup_error)?;
+            let plan = Plan {
+                conn: args.conn,
+                start: args.start.unwrap_or(args.pace),
+                pace: args.pace,
+                phase_duration: args.common.phase,
+                timeout: args.common.timeout,
+                accept: args.common.accept,
+                max_concurrency: args.max_concurrency,
+            };
+            let acceptance = plan.validate().map_err(setup_error)?;
+            interrupt()?;
+            crate::run(
+                &target,
+                plan,
+                &stop,
+                &mut Printer { acceptance, each: None },
+            )
+        }
+        Test::Connections(args) => {
+            let target = target(&args.common).map_err(setup_error)?;
+            let plan = ConnectionPlan {
+                start: args.start.unwrap_or(args.pace),
+                pace: args.pace,
+                requests: args.requests,
+                phase_duration: args.common.phase,
+                timeout: args.common.timeout,
+                accept: args.common.accept,
+                max_owners: args.max_owners,
+            };
+            let acceptance = plan.validate().map_err(setup_error)?;
+            interrupt()?;
+            crate::run_connections(
+                &target,
+                plan,
+                &stop,
+                &mut Printer { acceptance, each: Some(plan.requests) },
+            )
+        }
+    }
+}
+
+struct Printer {
+    acceptance: Acceptance,
+    /// Requests each connection carries, in the connection test.
+    each: Option<usize>,
+}
+
+impl Printer {
+    fn unit(&self) -> Unit {
+        match self.each {
+            None => Unit::Requests,
+            Some(_) => Unit::Connections,
+        }
+    }
+}
+
 impl Observer for Printer {
     fn phase_started(
         &mut self,
         phase: &Phase,
     ) {
-        println!(
-            "Phase {}: {} connections x {} requests = {} concurrent requests | window={}",
-            phase.index,
-            phase.connections,
-            phase.requests_per_connection,
-            phase.total_concurrency,
-            humantime::format_duration(phase.duration)
-        );
+        match self.each {
+            None => println!(
+                "Phase {}: {} connections x {} requests = {} concurrent requests | window={}",
+                phase.index,
+                phase.connections,
+                phase.requests_per_connection,
+                phase.total_concurrency,
+                humantime::format_duration(phase.duration)
+            ),
+            Some(each) => println!(
+                "Phase {}: {} concurrent connections, {} requests each | window={}",
+                phase.index,
+                phase.connections,
+                each,
+                humantime::format_duration(phase.duration)
+            ),
+        }
     }
+
     fn phase_finished(
         &mut self,
         stats: &PhaseStats,
     ) {
+        let accepted = stats.accepted(self.acceptance);
         let marker = if stats.cancelled {
             "Cancelled"
-        } else if stats.accepted(self.0) {
+        } else if accepted {
             "Done"
         } else {
             "Broken"
         };
-        if stats.accepted(self.0) {
-            println!(
-                "  {marker} ({} concurrent requests)",
-                stats.phase.total_concurrency
-            );
+        let unit = self.unit().name();
+        if accepted {
+            println!("  {marker} ({} {unit})", stats.phase.total_concurrency);
         } else {
-            eprintln!(
-                "  {marker} ({} concurrent requests)",
-                stats.phase.total_concurrency
+            eprintln!("  {marker} ({} {unit})", stats.phase.total_concurrency);
+        }
+        if let Some(setups) = &stats.setups {
+            let setup_mean = setups
+                .mean_millis()
+                .map_or_else(|| "n/a".to_owned(), |mean| format!("{mean:.3}"));
+            println!(
+                "  connections: attempts={} established={} failed={} timeout={} resumed={} established/s={:.2} setup-avg-ms={setup_mean} setup-max={}",
+                setups.attempted,
+                setups.established,
+                setups.failed,
+                setups.timeout,
+                setups.resumed,
+                stats.connections_per_sec(),
+                humantime::format_duration(setups.longest)
             );
         }
         println!(
@@ -241,35 +440,5 @@ impl Observer for Printer {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn parses_numeric_concurrency_without_rate_units_or_warmup() {
-        let base = [
-            "brk",
-            "http://example.test/plain",
-            "--conn",
-            "4",
-            "--phase",
-            "10s",
-            "--pace",
-            "100",
-            "--timeout",
-            "2s",
-        ];
-        let mut arguments = base.to_vec();
-        arguments.extend(["--start", "500", "--sla", "99.99", "--max", "1000"]);
-        let args = Args::try_parse_from(arguments).unwrap();
-        assert_eq!(args.conn, 4);
-        assert_eq!(args.start, Some(500));
-        assert_eq!(args.pace, 100);
-        assert_eq!(args.max_concurrency, Some(1_000));
-        for unsupported in ["--warmup", "--tls", "--proto", "-t", "--max-rate"]
-        {
-            let mut arguments = base.to_vec();
-            arguments.extend([unsupported, "1"]);
-            assert!(Args::try_parse_from(arguments).is_err());
-        }
-        assert!(Args::try_parse_from(["brk", "http://example.test"]).is_err());
-    }
-}
+#[path = "../tests/cli.rs"]
+mod tests;

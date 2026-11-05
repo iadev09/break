@@ -23,6 +23,8 @@ pub struct Target {
     connect: Option<SocketAddr>,
     #[cfg(feature = "tls")]
     trust: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
+    #[cfg(feature = "tls")]
+    resume: bool,
 }
 
 impl Target {
@@ -66,6 +68,8 @@ impl Target {
             connect: None,
             #[cfg(feature = "tls")]
             trust: None,
+            #[cfg(feature = "tls")]
+            resume: true,
         })
     }
 
@@ -100,6 +104,14 @@ impl Target {
         }
         self.trust = Some(authorities);
         Ok(self)
+    }
+
+    /// Make every TLS handshake a full one. Sessions are resumed otherwise,
+    /// as clients that return to a server do.
+    #[cfg(feature = "tls")]
+    pub fn without_resumption(mut self) -> Self {
+        self.resume = false;
+        self
     }
 
     /// What every connection to an `https://` target presents and verifies.
@@ -137,11 +149,18 @@ impl Target {
         .with_root_certificates(roots)
         .with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        if !self.resume {
+            config.resumption = rustls::client::Resumption::disabled();
+        }
         let name = rustls::pki_types::ServerName::try_from(host.to_owned())
             .map_err(|_| {
                 BreakReason::Invalid("target host is not a TLS server name")
             })?;
-        Ok(transport::secure::Tls { config: Arc::new(config), name })
+        Ok(transport::secure::Tls {
+            config: Arc::new(config),
+            name,
+            resume: self.resume,
+        })
     }
 
     pub fn expect_status(
@@ -179,13 +198,17 @@ impl Target {
         #[cfg(feature = "tls")]
         let tls = secure.then(|| self.tls(host)).transpose()?;
         let path = self.uri.path_and_query().map_or("/", |path| path.as_str());
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {}\r\n\r\n",
-            self.uri.authority().unwrap()
+        let host_line = self.uri.authority().unwrap();
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {host_line}\r\n\r\n");
+        // The last request of a connection that the client means to end.
+        let closing = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host_line}\r\nConnection: close\r\n\r\n"
         );
         Ok(Prepared {
             addresses,
             request: request.into_bytes(),
+            closing: closing.into_bytes(),
             status: self.status,
             body: self.body.clone(),
             #[cfg(feature = "tls")]
@@ -197,6 +220,7 @@ impl Target {
 pub(crate) struct Prepared {
     addresses: Arc<[SocketAddr]>,
     request: Vec<u8>,
+    closing: Vec<u8>,
     status: Option<StatusCode>,
     body: Option<Bytes>,
     #[cfg(feature = "tls")]
@@ -208,6 +232,7 @@ impl Prepared {
         Client {
             addresses: self.addresses.clone(),
             request: self.request.clone().into_boxed_slice(),
+            closing: self.closing.clone().into_boxed_slice(),
             status: self.status,
             body: self.body.clone(),
             #[cfg(feature = "tls")]
@@ -219,6 +244,7 @@ impl Prepared {
 pub(crate) struct Client {
     addresses: Arc<[SocketAddr]>,
     request: Box<[u8]>,
+    closing: Box<[u8]>,
     status: Option<StatusCode>,
     body: Option<Bytes>,
     #[cfg(feature = "tls")]

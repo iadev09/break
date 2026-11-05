@@ -8,15 +8,26 @@ use tokio::sync::{mpsc as async_mpsc, watch};
 use crate::http1::{Client, Connection, Prepared, Window, run_slot};
 use crate::{
     BreakReason, CancellationToken, Counts, LatencyStats, LoadStats, Phase,
+    Setups,
 };
 
 pub(crate) struct Command {
     pub phase: Phase,
+    /// The connection test: how many owners this worker runs in the phase
+    /// and how many requests each of their connections carries. `None` is
+    /// the request test, which drives the worker's retained connections.
+    pub churn: Option<Churn>,
     pub timeout: std::time::Duration,
     pub start: watch::Receiver<Option<Instant>>,
     pub phase_stop: CancellationToken,
     pub ready: Sender<()>,
     pub reply: Sender<Summary>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Churn {
+    pub owners: usize,
+    pub requests: usize,
 }
 
 #[derive(Default)]
@@ -26,6 +37,7 @@ pub(crate) struct Summary {
     pub failure: Option<BreakReason>,
     pub load: LoadStats,
     pub latency: LatencyStats,
+    pub setups: Setups,
 }
 
 struct Worker {
@@ -39,12 +51,15 @@ pub(crate) struct Workers {
 }
 
 impl Workers {
+    /// `owners` bounds the worker threads; `connections` of them are kept
+    /// open across phases. The connection test keeps none.
     pub fn start(
         prepared: &Prepared,
+        owners: usize,
         connections: usize,
         stop: CancellationToken,
     ) -> Result<Self, BreakReason> {
-        let count = thread::available_parallelism()?.get().min(connections);
+        let count = thread::available_parallelism()?.get().min(owners);
         let mut owner = Self { workers: Vec::new(), stop };
         owner
             .workers
@@ -163,10 +178,16 @@ async fn serve(
                 duration: command.phase.duration,
                 timeout: command.timeout,
                 per_connection: command.phase.requests_per_connection,
+                lifetime: command.churn.map(|churn| churn.requests),
             };
             let mut pending = FuturesUnordered::new();
-            for (index, slot) in slots.iter_mut().enumerate() {
-                let connection = slot.take();
+            // The request test resumes each retained connection; the
+            // connection test keeps none and starts its owners without one.
+            let owners =
+                command.churn.map_or(slots.len(), |churn| churn.owners);
+            let mut retained = slots.iter_mut();
+            for index in 0..owners {
+                let connection = retained.next().and_then(Option::take);
                 let client = &client;
                 let stop = &stop;
                 let phase_stop = &command.phase_stop;
@@ -180,7 +201,10 @@ async fn serve(
             }
             while let Some((index, (connection, result))) = pending.next().await
             {
-                slots[index] = connection;
+                if command.churn.is_none() {
+                    slots[index] = connection;
+                }
+                summary.setups.add(result.setups);
                 summary.counts.add(result.counts);
                 summary.at_target += usize::from(result.at_target);
                 summary.load.add(result.load);
