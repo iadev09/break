@@ -220,17 +220,17 @@ impl Owner {
         if phase.cancelled {
             return Opened::Failed(BreakReason::Cancelled);
         }
-        if deadline <= Instant::now() {
-            return Opened::Failed(
+        // The socket is asked before the deadline is judged: a setup that
+        // completes on this turn has completed.
+        match self.advance(stage, phase) {
+            Ok(Ok(stream)) => Opened::Ready(stream),
+            Ok(Err(_)) if deadline <= Instant::now() => Opened::Failed(
                 io::Error::new(
                     io::ErrorKind::TimedOut,
                     "connection deadline exceeded",
                 )
                 .into(),
-            );
-        }
-        match self.advance(stage, phase) {
-            Ok(Ok(stream)) => Opened::Ready(stream),
+            ),
             Ok(Err(stage)) => {
                 self.state =
                     State::Setup(Setup { began, deadline, address, stage });

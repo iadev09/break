@@ -340,26 +340,39 @@ impl Conn {
             if !admitting {
                 meter.close_admission(now);
             }
-            if self
-                .pending
-                .front()
-                .is_some_and(|attempt| attempt.deadline <= now)
-            {
-                self.abandon(&mut summary.counts, Outcome::Abandoned, meter);
-                return Step::End(End::Reconnect);
-            }
-            if self.remaining == Some(0)
-                && self.pending.is_empty()
-                && self.writing.is_none()
-            {
-                // Every request of this connection is answered.
-                return Step::End(End::Reconnect);
-            }
-            if !admitting && self.pending.is_empty() {
-                return Step::End(End::Retain);
-            }
-            if worked {
-                return if flags.readable { Step::Again } else { Step::Wait };
+            // What has arrived is read before a deadline is judged. A reply
+            // that waited in the socket past its deadline is a late reply and
+            // is counted as one; it is not a connection to give up.
+            if worked || !flags.readable {
+                if self
+                    .pending
+                    .front()
+                    .is_some_and(|attempt| attempt.deadline <= now)
+                {
+                    self.abandon(
+                        &mut summary.counts,
+                        Outcome::Abandoned,
+                        meter,
+                    );
+                    return Step::End(End::Reconnect);
+                }
+                if self.remaining == Some(0)
+                    && self.pending.is_empty()
+                    && self.writing.is_none()
+                {
+                    // Every request of this connection is answered.
+                    return Step::End(End::Reconnect);
+                }
+                if !admitting && self.pending.is_empty() {
+                    return Step::End(End::Retain);
+                }
+                if worked {
+                    return if flags.readable {
+                        Step::Again
+                    } else {
+                        Step::Wait
+                    };
+                }
             }
             worked = true;
             if flags.readable {
