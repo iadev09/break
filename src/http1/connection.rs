@@ -65,6 +65,9 @@ pub(crate) struct Connection {
     buffer: Vec<u8>,
     writing: Option<Writing>,
     first_deadline: Option<Instant>,
+    /// The last write found the socket full; the next one waits for it to
+    /// report room instead of being tried again.
+    blocked: bool,
     /// Requests this connection may still admit, in the connection test.
     remaining: Option<usize>,
     /// The peer answered the closing request and announced its close.
@@ -199,6 +202,7 @@ impl Connection {
             // Where setup is measured on its own, the first request's budget
             // starts when it is written, like every other request's.
             first_deadline: window.lifetime.is_none().then_some(deadline),
+            blocked: false,
             remaining: window.lifetime,
             peer_closing: false,
         })
@@ -247,6 +251,7 @@ impl Connection {
     fn receive(
         &mut self,
         size: usize,
+        now: Instant,
         counts: &mut Counts,
         latency: &mut LatencyStats,
         meter: &mut Meter,
@@ -263,7 +268,6 @@ impl Connection {
             if let Some(reply) = reply {
                 let attempt = self.pending.pop_front().unwrap();
                 let deadline = attempt.deadline;
-                let now = Instant::now();
                 attempt.record_response(now, latency);
                 meter.change(
                     self.pending
@@ -305,6 +309,16 @@ impl Connection {
             ));
         }
         let end = window.start + window.duration;
+        // The waiters and the timer are set up once for the phase, not once a
+        // turn. The timer is moved only when the deadline it must observe is
+        // earlier than the one it holds, or that one has passed: a wake that
+        // comes early costs one turn, where arming it for every request
+        // costs every request.
+        let stopped = stop.cancelled();
+        let phase_stopped = phase_stop.cancelled();
+        let mut armed = end;
+        let timer = tokio::time::sleep_until(armed.into());
+        tokio::pin!(stopped, phase_stopped, timer);
         loop {
             tokio::task::consume_budget().await;
             let now = Instant::now();
@@ -344,15 +358,28 @@ impl Connection {
                 let deadline = attempt.deadline;
                 if admitting { deadline.min(end) } else { deadline }
             });
+            if deadline < armed || armed <= now {
+                armed = deadline;
+                timer.as_mut().reset(armed.into());
+            }
+            // The socket first: while it has work, nothing else is asked.
+            // Deadlines, the phase end and cancellation are also read at the
+            // top of every turn, so none of them depends on being polled here.
             let ready = tokio::select! {
-                _ = stop.cancelled(), if admitting => continue,
-                _ = phase_stop.cancelled(), if admitting => continue,
-                _ = tokio::time::sleep_until(deadline.into()) => continue,
+                biased;
                 result = self.stream.ready(interest) => match result {
                     Ok(ready) => ready,
                     Err(error) => { self.abandon(&mut summary.counts, io_outcome(&error), meter); return End::Failed(error.into()); }
                 },
+                () = &mut timer => continue,
+                () = &mut stopped, if admitting => continue,
+                () = &mut phase_stopped, if admitting => continue,
             };
+            // One reading of the clock serves everything this wake does.
+            let now = Instant::now();
+            if ready.is_writable() {
+                self.blocked = false;
+            }
             if ready.is_readable() {
                 match self.stream.try_read(&mut self.buffer) {
                     Ok(0) => {
@@ -362,7 +389,6 @@ impl Connection {
                         {
                             complete = true;
                             let deadline = attempt.deadline;
-                            let now = Instant::now();
                             attempt.record_response(now, &mut summary.latency);
                             meter.change(
                                 self.pending.len().saturating_sub(usize::from(
@@ -392,6 +418,7 @@ impl Connection {
                     Ok(size) => {
                         match self.receive(
                             size,
+                            now,
                             &mut summary.counts,
                             &mut summary.latency,
                             meter,
@@ -432,7 +459,17 @@ impl Connection {
                     }
                 }
             }
-            if ready.is_writable() && can_write {
+            // A response just read may have freed a slot. The next request is
+            // written in this same turn, without first waiting to be told
+            // that a socket which was never full has room.
+            let can_write = self.writing.is_some()
+                || (now < end
+                    && !stop.is_cancelled()
+                    && !phase_stop.is_cancelled()
+                    && self.pending.len() < window.per_connection
+                    && self.remaining != Some(0));
+            if can_write && !self.blocked {
+                let mut wake = Some(now);
                 loop {
                     // Use Tokio's own cooperative quantum, not an invented batch limit.
                     // Returning to the outer loop services reads before another write burst.
@@ -440,7 +477,10 @@ impl Connection {
                         break;
                     }
                     tokio::task::consume_budget().await;
-                    let now = Instant::now();
+                    // The first write of a burst is at the wake's own time;
+                    // later ones read the clock, so a long burst does not
+                    // date its requests early.
+                    let now = wake.take().unwrap_or_else(Instant::now);
                     if self
                         .pending
                         .front()
@@ -490,7 +530,6 @@ impl Connection {
                             if next == request.len() {
                                 self.writing = None;
                                 summary.counts.sent += 1;
-                                let now = Instant::now();
                                 meter.stats.max_send_delay = meter
                                     .stats
                                     .max_send_delay
@@ -505,6 +544,7 @@ impl Connection {
                             if error.kind() == io::ErrorKind::WouldBlock =>
                         {
                             meter.stats.write_blocked += 1;
+                            self.blocked = true;
                             break;
                         }
                         Err(error) => {
