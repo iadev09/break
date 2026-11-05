@@ -1,12 +1,15 @@
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
-use tokio::io::Interest;
-use tokio::net::TcpStream;
+use mio::net::TcpStream;
+#[cfg(feature = "http2")]
 use tokio_util::sync::CancellationToken;
 
 use super::decode::Decoder;
+#[cfg(feature = "tls")]
+use super::transport::secure::Secure;
+#[cfg(feature = "http2")]
 use super::transport::{Sessions, Transport, own_sessions};
 use super::{Client, Outcome, is_local_resource};
 use crate::load::Meter;
@@ -58,135 +61,117 @@ impl Attempt {
     }
 }
 
-pub(crate) struct Connection {
-    stream: Transport,
+/// The socket of one HTTP/1.1 connection, as the engine reads and writes it.
+pub(super) enum Stream {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<Secure<TcpStream>>),
+}
+
+impl Stream {
+    /// One read. The second value is whether more may be waiting: a plain
+    /// socket that did not fill the buffer has been emptied, and its next
+    /// bytes announce themselves with a new readiness event. Under TLS the
+    /// records behind the decrypted bytes are not visible, so only a read
+    /// that finds nothing settles it.
+    fn read(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> io::Result<(usize, bool)> {
+        match self {
+            Self::Plain(stream) => {
+                let size = stream.read(buffer)?;
+                Ok((size, size == buffer.len()))
+            }
+            #[cfg(feature = "tls")]
+            Self::Tls(secure) => Ok((secure.try_read(buffer)?, true)),
+        }
+    }
+
+    fn write(
+        &mut self,
+        bytes: &[u8],
+    ) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(bytes),
+            #[cfg(feature = "tls")]
+            Self::Tls(secure) => secure.try_write(bytes),
+        }
+    }
+
+    pub(super) fn negotiated(&self) -> Option<crate::Negotiated> {
+        match self {
+            Self::Plain(_) => None,
+            #[cfg(feature = "tls")]
+            Self::Tls(secure) => secure.negotiated(),
+        }
+    }
+
+    pub(super) fn resumed(&self) -> bool {
+        match self {
+            Self::Plain(_) => false,
+            #[cfg(feature = "tls")]
+            Self::Tls(secure) => secure.resumed(),
+        }
+    }
+}
+
+/// What an owner knows of its socket between readiness events. An event
+/// sets a side; a read that finds nothing or a write that finds no room
+/// clears it. Nothing is asked of the kernel in between.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Flags {
+    pub readable: bool,
+    pub writable: bool,
+    /// The peer ended its side, or the socket failed. No further event will
+    /// announce it, so a read that emptied the socket is not the last one.
+    pub ended: bool,
+}
+
+/// What one turn of a connection works with.
+pub(super) struct Turn<'a> {
+    pub client: &'a Client,
+    pub window: Window,
+    /// The run or the phase was stopped: nothing new is admitted.
+    pub halted: bool,
+    /// Deadlines of this thread in the order they were set. Every request has
+    /// the same budget, so the order is also the order they fall due.
+    pub timers: &'a mut VecDeque<(Instant, usize)>,
+    /// The owner the deadlines belong to.
+    pub owner: usize,
+}
+
+pub(super) enum Step {
+    /// Nothing more until the socket or a deadline says so.
+    Wait,
+    /// The socket may hold more; the other owners go first.
+    Again,
+    End(End),
+}
+
+/// One HTTP/1.1 connection: a state the engine turns, not a task.
+pub(crate) struct Conn {
+    stream: Stream,
     decoder: Decoder,
     pending: VecDeque<Attempt>,
     buffer: Vec<u8>,
     writing: Option<Writing>,
     first_deadline: Option<Instant>,
-    /// The last write found the socket full; the next one waits for it to
-    /// report room instead of being tried again.
-    blocked: bool,
     /// Requests this connection may still admit, in the connection test.
     remaining: Option<usize>,
     /// The peer answered the closing request and announced its close.
-    peer_closing: bool,
+    pub(super) peer_closing: bool,
 }
 
-pub(crate) enum End {
-    Retain,
-    Reconnect,
-    Failed(BreakReason),
-}
-
-/// One connection of the protocol the target speaks, as its owner drives it.
-/// The owner's loop, its setup accounting and its phase rules are the same
-/// for every protocol; only what happens on the connection differs.
-pub(crate) trait Carrier: Sized {
-    async fn connect(
+impl Conn {
+    /// `deadline` is the setup's own. Where setup is not measured apart, the
+    /// first request answers within it.
+    pub(super) fn new(
+        stream: Stream,
         client: &Client,
         window: Window,
-        stop: &CancellationToken,
-        sessions: Option<&Sessions>,
-    ) -> Result<Self, BreakReason>;
-
-    async fn exchange(
-        &mut self,
-        client: &Client,
-        window: Window,
-        stop: &CancellationToken,
-        phase_stop: &CancellationToken,
-        summary: &mut Summary,
-        meter: &mut Meter,
-    ) -> End;
-
-    fn negotiated(&self) -> Option<crate::Negotiated>;
-
-    fn resumed(&self) -> bool;
-
-    /// Let a connection that reached the end of its declared lifetime end.
-    async fn retire(
-        self,
-        window: Window,
-    );
-}
-
-/// Establish the transport of one connection within the setup deadline: the
-/// TCP stream and, for an `https://` target, its TLS handshake.
-pub(crate) async fn open(
-    client: &Client,
-    window: Window,
-    stop: &CancellationToken,
-    sessions: Option<&Sessions>,
-) -> Result<(Transport, Instant), BreakReason> {
-    let deadline = Instant::now() + window.timeout;
-    let stream = tokio::select! {
-        _ = stop.cancelled() => return Err(BreakReason::Cancelled),
-        result = tokio::time::timeout_at(deadline.into(), async {
-            let stream =
-                TcpStream::connect(client.addresses.as_ref()).await?;
-            stream.set_nodelay(true)?;
-            // An `https://` target is connected once its handshake is done.
-            Transport::open(stream, client, sessions).await
-        }) => {
-            result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection deadline exceeded"))??
-        }
-    };
-    Ok((stream, deadline))
-}
-
-impl Carrier for Connection {
-    async fn connect(
-        client: &Client,
-        window: Window,
-        stop: &CancellationToken,
-        sessions: Option<&Sessions>,
+        deadline: Instant,
     ) -> Result<Self, BreakReason> {
-        Connection::connect(client, window, stop, sessions).await
-    }
-
-    async fn exchange(
-        &mut self,
-        client: &Client,
-        window: Window,
-        stop: &CancellationToken,
-        phase_stop: &CancellationToken,
-        summary: &mut Summary,
-        meter: &mut Meter,
-    ) -> End {
-        Connection::exchange(
-            self, client, window, stop, phase_stop, summary, meter,
-        )
-        .await
-    }
-
-    fn negotiated(&self) -> Option<crate::Negotiated> {
-        self.stream.negotiated()
-    }
-
-    fn resumed(&self) -> bool {
-        self.stream.resumed()
-    }
-
-    async fn retire(
-        mut self,
-        window: Window,
-    ) {
-        if self.peer_closing {
-            self.await_peer_close(Instant::now() + window.timeout).await;
-        }
-    }
-}
-
-impl Connection {
-    async fn connect(
-        client: &Client,
-        window: Window,
-        stop: &CancellationToken,
-        sessions: Option<&Sessions>,
-    ) -> Result<Self, BreakReason> {
-        let (stream, deadline) = open(client, window, stop, sessions).await?;
         let mut buffer = Vec::new();
         // This is an I/O chunk, not a response-size or request-concurrency limit.
         buffer
@@ -202,32 +187,45 @@ impl Connection {
             // Where setup is measured on its own, the first request's budget
             // starts when it is written, like every other request's.
             first_deadline: window.lifetime.is_none().then_some(deadline),
-            blocked: false,
             remaining: window.lifetime,
             peer_closing: false,
         })
     }
 
-    /// Read until the peer ends the connection it said it would close, so
-    /// that the closing wait state is the peer's and not this client's.
-    async fn await_peer_close(
+    pub(super) fn stream(&self) -> &Stream {
+        &self.stream
+    }
+
+    /// Room for a phase's requests, before any of them is admitted.
+    pub(super) fn reserve(
         &mut self,
-        deadline: Instant,
-    ) {
-        loop {
-            let ready = tokio::time::timeout_at(
-                deadline.into(),
-                self.stream.ready(Interest::READABLE),
-            )
-            .await;
-            if !matches!(ready, Ok(Ok(_))) {
-                return;
-            }
-            match self.stream.try_read(&mut self.buffer) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                _ => return,
+        window: Window,
+    ) -> Result<(), BreakReason> {
+        self.pending
+            .try_reserve(window.per_connection)
+            .map_err(|_| BreakReason::Resources("request deadline slots"))
+    }
+
+    /// The deadline this connection is waiting on, if it has one.
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.pending.front().map(|attempt| attempt.deadline)
+    }
+
+    /// Whether the peer has ended the connection it said it would close.
+    /// Reading to the end leaves the closing wait state with the peer.
+    pub(super) fn peer_closed(
+        &mut self,
+        flags: &mut Flags,
+    ) -> bool {
+        while flags.readable {
+            match self.stream.read(&mut self.buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    flags.readable = false;
+                }
+                _ => return true,
             }
         }
+        false
     }
 
     fn abandon(
@@ -294,35 +292,23 @@ impl Connection {
         Ok(false)
     }
 
-    async fn exchange(
+    /// Everything this connection can do now: what was due, one read, and
+    /// the requests its free slots admit. It never waits; it says what it
+    /// needs next.
+    pub(super) fn exchange(
         &mut self,
-        client: &Client,
-        window: Window,
-        stop: &CancellationToken,
-        phase_stop: &CancellationToken,
+        turn: &mut Turn<'_>,
+        flags: &mut Flags,
         summary: &mut Summary,
         meter: &mut Meter,
-    ) -> End {
-        if self.pending.try_reserve(window.per_connection).is_err() {
-            return End::Failed(BreakReason::Resources(
-                "request deadline slots",
-            ));
-        }
+    ) -> Step {
+        let window = turn.window;
         let end = window.start + window.duration;
-        // The waiters and the timer are set up once for the phase, not once a
-        // turn. The timer is moved only when the deadline it must observe is
-        // earlier than the one it holds, or that one has passed: a wake that
-        // comes early costs one turn, where arming it for every request
-        // costs every request.
-        let stopped = stop.cancelled();
-        let phase_stopped = phase_stop.cancelled();
-        let mut armed = end;
-        let timer = tokio::time::sleep_until(armed.into());
-        tokio::pin!(stopped, phase_stopped, timer);
+        let mut worked = false;
         loop {
+            // One reading of the clock serves everything this pass does.
             let now = Instant::now();
-            let admitting =
-                now < end && !stop.is_cancelled() && !phase_stop.is_cancelled();
+            let admitting = now < end && !turn.halted;
             if !admitting {
                 meter.close_admission(now);
             }
@@ -332,56 +318,25 @@ impl Connection {
                 .is_some_and(|attempt| attempt.deadline <= now)
             {
                 self.abandon(&mut summary.counts, Outcome::Abandoned, meter);
-                return End::Reconnect;
+                return Step::End(End::Reconnect);
             }
             if self.remaining == Some(0)
                 && self.pending.is_empty()
                 && self.writing.is_none()
             {
                 // Every request of this connection is answered.
-                return End::Reconnect;
+                return Step::End(End::Reconnect);
             }
             if !admitting && self.pending.is_empty() {
-                return End::Retain;
+                return Step::End(End::Retain);
             }
-            let can_write = self.writing.is_some()
-                || (admitting
-                    && self.pending.len() < window.per_connection
-                    && self.remaining != Some(0));
-            let interest = if can_write {
-                Interest::READABLE | Interest::WRITABLE
-            } else {
-                Interest::READABLE
-            };
-            let deadline = self.pending.front().map_or(end, |attempt| {
-                let deadline = attempt.deadline;
-                if admitting { deadline.min(end) } else { deadline }
-            });
-            if deadline < armed || armed <= now {
-                armed = deadline;
-                timer.as_mut().reset(armed.into());
+            if worked {
+                return if flags.readable { Step::Again } else { Step::Wait };
             }
-            // The socket first: while it has work, nothing else is asked.
-            // Deadlines, the phase end and cancellation are also read at the
-            // top of every turn, so none of them depends on being polled here.
-            let ready = tokio::select! {
-                biased;
-                result = self.stream.ready(interest) => match result {
-                    Ok(ready) => ready,
-                    Err(error) => { self.abandon(&mut summary.counts, io_outcome(&error), meter); return End::Failed(error.into()); }
-                },
-                () = &mut timer => continue,
-                () = &mut stopped, if admitting => continue,
-                () = &mut phase_stopped, if admitting => continue,
-            };
-            // One reading of the clock serves everything this wake does.
-            let now = Instant::now();
-            if ready.is_writable() {
-                self.blocked = false;
-            }
-            if ready.is_readable() {
-                match self.stream.try_read(&mut self.buffer) {
-                    Ok(0) => {
+            worked = true;
+            if flags.readable {
+                match self.stream.read(&mut self.buffer) {
+                    Ok((0, _)) => {
                         let mut complete = false;
                         if let Some(reply) = self.decoder.eof()
                             && let Some(attempt) = self.pending.pop_front()
@@ -412,9 +367,10 @@ impl Connection {
                             },
                             meter,
                         );
-                        return End::Reconnect;
+                        return Step::End(End::Reconnect);
                     }
-                    Ok(size) => {
+                    Ok((size, more)) => {
+                        flags.readable = more || flags.ended;
                         match self.receive(
                             size,
                             now,
@@ -429,7 +385,7 @@ impl Connection {
                                     Outcome::Abandoned,
                                     meter,
                                 );
-                                return End::Reconnect;
+                                return Step::End(End::Reconnect);
                             }
                             Ok(false) => {}
                             Err(error) => {
@@ -438,11 +394,12 @@ impl Connection {
                                     Outcome::Abandoned,
                                     meter,
                                 );
-                                return End::Failed(error);
+                                return Step::End(End::Failed(error));
                             }
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        flags.readable = false;
                     }
                     Err(error) => {
                         self.abandon(
@@ -450,115 +407,170 @@ impl Connection {
                             io_outcome(&error),
                             meter,
                         );
-                        return if is_local_resource(&error) {
+                        return Step::End(if is_local_resource(&error) {
                             End::Failed(error.into())
                         } else {
                             End::Reconnect
-                        };
+                        });
                     }
                 }
             }
             // A response just read may have freed a slot. The next request is
-            // written in this same turn, without first waiting to be told
-            // that a socket which was never full has room.
-            let can_write = self.writing.is_some()
-                || (now < end
-                    && !stop.is_cancelled()
-                    && !phase_stop.is_cancelled()
-                    && self.pending.len() < window.per_connection
-                    && self.remaining != Some(0));
-            if can_write && !self.blocked {
-                let mut wake = Some(now);
-                // A burst ends with the free slots or with a full socket;
-                // reads are served again before the next one.
-                loop {
-                    // The first write of a burst is at the wake's own time;
-                    // later ones read the clock, so a long burst does not
-                    // date its requests early.
-                    let now = wake.take().unwrap_or_else(Instant::now);
-                    if self
-                        .pending
-                        .front()
-                        .is_some_and(|attempt| attempt.deadline <= now)
+            // written in this same turn. A burst ends with the free slots or
+            // with a full socket; reads are served again before the next one.
+            let mut wake = Some(now);
+            while flags.writable {
+                // The first write of a burst is at the turn's own time; later
+                // ones read the clock, so a long burst does not date its
+                // requests early.
+                let now = wake.take().unwrap_or_else(Instant::now);
+                if self
+                    .pending
+                    .front()
+                    .is_some_and(|attempt| attempt.deadline <= now)
+                {
+                    break;
+                }
+                if self.writing.is_none() {
+                    if now >= end
+                        || turn.halted
+                        || self.pending.len() >= window.per_connection
+                        || self.remaining == Some(0)
                     {
                         break;
                     }
-                    if self.writing.is_none() {
-                        if now >= end
-                            || stop.is_cancelled()
-                            || phase_stop.is_cancelled()
-                            || self.pending.len() >= window.per_connection
-                            || self.remaining == Some(0)
-                        {
-                            break;
+                    let deadline = match self.first_deadline.take() {
+                        Some(deadline) => deadline,
+                        None => {
+                            let deadline = now + window.timeout;
+                            turn.timers.push_back((deadline, turn.owner));
+                            deadline
                         }
-                        let deadline = self
-                            .first_deadline
-                            .take()
-                            .unwrap_or(now + window.timeout);
-                        self.pending
-                            .push_back(Attempt { deadline, began: now });
-                        let closing = self.remaining == Some(1);
-                        if let Some(remaining) = &mut self.remaining {
-                            *remaining -= 1;
-                        }
-                        self.writing =
-                            Some(Writing { offset: 0, began: now, closing });
-                    }
-                    let writing = self.writing.unwrap();
-                    let request = if writing.closing {
-                        &client.closing
-                    } else {
-                        &client.request
                     };
-                    match self.stream.try_write(&request[writing.offset..]) {
-                        Ok(0) => {
-                            self.abandon(
-                                &mut summary.counts,
-                                Outcome::Transport,
-                                meter,
-                            );
-                            return End::Reconnect;
+                    self.pending.push_back(Attempt { deadline, began: now });
+                    let closing = self.remaining == Some(1);
+                    if let Some(remaining) = &mut self.remaining {
+                        *remaining -= 1;
+                    }
+                    self.writing =
+                        Some(Writing { offset: 0, began: now, closing });
+                }
+                let writing = self.writing.unwrap();
+                let request = if writing.closing {
+                    &turn.client.closing
+                } else {
+                    &turn.client.request
+                };
+                match self.stream.write(&request[writing.offset..]) {
+                    Ok(0) => {
+                        self.abandon(
+                            &mut summary.counts,
+                            Outcome::Transport,
+                            meter,
+                        );
+                        return Step::End(End::Reconnect);
+                    }
+                    Ok(written) => {
+                        let next = writing.offset + written;
+                        if next == request.len() {
+                            self.writing = None;
+                            summary.counts.sent += 1;
+                            meter.stats.max_send_delay = meter
+                                .stats
+                                .max_send_delay
+                                .max(now.duration_since(writing.began));
+                            meter.change(self.pending.len(), now);
+                        } else {
+                            self.writing =
+                                Some(Writing { offset: next, ..writing });
                         }
-                        Ok(written) => {
-                            let next = writing.offset + written;
-                            if next == request.len() {
-                                self.writing = None;
-                                summary.counts.sent += 1;
-                                meter.stats.max_send_delay = meter
-                                    .stats
-                                    .max_send_delay
-                                    .max(now.duration_since(writing.began));
-                                meter.change(self.pending.len(), now);
-                            } else {
-                                self.writing =
-                                    Some(Writing { offset: next, ..writing });
-                            }
-                        }
-                        Err(error)
-                            if error.kind() == io::ErrorKind::WouldBlock =>
-                        {
-                            meter.stats.write_blocked += 1;
-                            self.blocked = true;
-                            break;
-                        }
-                        Err(error) => {
-                            self.abandon(
-                                &mut summary.counts,
-                                io_outcome(&error),
-                                meter,
-                            );
-                            return if is_local_resource(&error) {
-                                End::Failed(error.into())
-                            } else {
-                                End::Reconnect
-                            };
-                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        meter.stats.write_blocked += 1;
+                        flags.writable = false;
+                    }
+                    Err(error) => {
+                        self.abandon(
+                            &mut summary.counts,
+                            io_outcome(&error),
+                            meter,
+                        );
+                        return Step::End(if is_local_resource(&error) {
+                            End::Failed(error.into())
+                        } else {
+                            End::Reconnect
+                        });
                     }
                 }
             }
         }
     }
+}
+
+pub(crate) enum End {
+    Retain,
+    Reconnect,
+    Failed(BreakReason),
+}
+
+/// One connection of a protocol that is driven through polls, as its owner
+/// drives it. HTTP/1.1 has an engine of its own; this is HTTP/2's.
+/// The owner's loop, its setup accounting and its phase rules are the same
+/// for every protocol; only what happens on the connection differs.
+#[cfg(feature = "http2")]
+pub(crate) trait Carrier: Sized {
+    async fn connect(
+        client: &Client,
+        window: Window,
+        stop: &CancellationToken,
+        sessions: Option<&Sessions>,
+    ) -> Result<Self, BreakReason>;
+
+    async fn exchange(
+        &mut self,
+        client: &Client,
+        window: Window,
+        stop: &CancellationToken,
+        phase_stop: &CancellationToken,
+        summary: &mut Summary,
+        meter: &mut Meter,
+    ) -> End;
+
+    fn negotiated(&self) -> Option<crate::Negotiated>;
+
+    fn resumed(&self) -> bool;
+
+    /// Let a connection that reached the end of its declared lifetime end.
+    async fn retire(
+        self,
+        window: Window,
+    );
+}
+
+/// Establish the transport of one connection within the setup deadline: the
+/// TCP stream and, for an `https://` target, its TLS handshake.
+#[cfg(feature = "http2")]
+pub(crate) async fn open(
+    client: &Client,
+    window: Window,
+    stop: &CancellationToken,
+    sessions: Option<&Sessions>,
+) -> Result<(Transport, Instant), BreakReason> {
+    let deadline = Instant::now() + window.timeout;
+    let stream = tokio::select! {
+        _ = stop.cancelled() => return Err(BreakReason::Cancelled),
+        result = tokio::time::timeout_at(deadline.into(), async {
+            let stream =
+                tokio::net::TcpStream::connect(client.addresses.as_ref())
+                    .await?;
+            stream.set_nodelay(true)?;
+            // An `https://` target is connected once its handshake is done.
+            Transport::open(stream, client, sessions).await
+        }) => {
+            result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection deadline exceeded"))??
+        }
+    };
+    Ok((stream, deadline))
 }
 
 fn io_outcome(error: &io::Error) -> Outcome {
@@ -590,6 +602,7 @@ fn retire_attempts(
 }
 
 /// One persistent owner per declared connection, not one task per request.
+#[cfg(feature = "http2")]
 pub(crate) async fn run_owner<C: Carrier>(
     client: &Client,
     mut connection: Option<C>,

@@ -1,10 +1,13 @@
 //! What carries one connection's bytes: a TCP stream as it is, or the same
 //! stream under TLS. Both are driven by socket readiness and non-blocking
-//! reads and writes, so the connection loop is the same for either.
+//! reads and writes, so the connection loop is the same for either. The TLS
+//! session is one type over either readiness loop: the HTTP/1.1 engine's own
+//! and, for HTTP/2 framing, Tokio's.
 
+#[cfg(feature = "http2")]
 use std::io;
 
-use tokio::io::{Interest, Ready};
+#[cfg(feature = "http2")]
 use tokio::net::TcpStream;
 
 use super::Client;
@@ -26,12 +29,14 @@ pub(crate) fn own_sessions(client: &Client) -> Option<Sessions> {
     }
 }
 
+#[cfg(feature = "http2")]
 pub(crate) enum Transport {
     Plain(TcpStream),
     #[cfg(feature = "tls")]
-    Tls(Box<secure::Secure>),
+    Tls(Box<secure::Secure<TcpStream>>),
 }
 
+#[cfg(feature = "http2")]
 impl Transport {
     /// Take an established TCP stream and, for an `https://` target, complete
     /// the TLS handshake on it. The caller's deadline covers both. `sessions`
@@ -66,39 +71,6 @@ impl Transport {
             Self::Plain(_) => false,
             #[cfg(feature = "tls")]
             Self::Tls(secure) => secure.resumed(),
-        }
-    }
-
-    pub(crate) async fn ready(
-        &mut self,
-        interest: Interest,
-    ) -> io::Result<Ready> {
-        match self {
-            Self::Plain(stream) => stream.ready(interest).await,
-            #[cfg(feature = "tls")]
-            Self::Tls(secure) => secure.ready(interest).await,
-        }
-    }
-
-    pub(crate) fn try_read(
-        &mut self,
-        buffer: &mut [u8],
-    ) -> io::Result<usize> {
-        match self {
-            Self::Plain(stream) => stream.try_read(buffer),
-            #[cfg(feature = "tls")]
-            Self::Tls(secure) => secure.try_read(buffer),
-        }
-    }
-
-    pub(crate) fn try_write(
-        &mut self,
-        bytes: &[u8],
-    ) -> io::Result<usize> {
-        match self {
-            Self::Plain(stream) => stream.try_write(bytes),
-            #[cfg(feature = "tls")]
-            Self::Tls(secure) => secure.try_write(bytes),
         }
     }
 }
@@ -176,7 +148,9 @@ pub(crate) mod secure {
     use std::sync::Arc;
 
     use rustls::pki_types::ServerName;
-    use tokio::io::{Interest, Ready};
+    #[cfg(feature = "http2")]
+    use tokio::io::Interest;
+    #[cfg(feature = "http2")]
     use tokio::net::TcpStream;
 
     /// The prepared client side of every connection to one target.
@@ -205,24 +179,72 @@ pub(crate) mod secure {
         }
     }
 
-    /// The socket as the TLS session reads and writes it: without blocking.
-    struct Socket<'a>(&'a TcpStream);
+    /// A non-blocking socket as the TLS session reads and writes it. The
+    /// session is the same over whichever readiness loop owns the socket.
+    pub(crate) trait Wire {
+        fn receive(
+            &self,
+            buffer: &mut [u8],
+        ) -> io::Result<usize>;
 
-    impl Read for Socket<'_> {
+        fn send(
+            &self,
+            bytes: &[u8],
+        ) -> io::Result<usize>;
+    }
+
+    impl Wire for mio::net::TcpStream {
+        fn receive(
+            &self,
+            buffer: &mut [u8],
+        ) -> io::Result<usize> {
+            let mut socket = self;
+            socket.read(buffer)
+        }
+
+        fn send(
+            &self,
+            bytes: &[u8],
+        ) -> io::Result<usize> {
+            let mut socket = self;
+            socket.write(bytes)
+        }
+    }
+
+    #[cfg(feature = "http2")]
+    impl Wire for TcpStream {
+        fn receive(
+            &self,
+            buffer: &mut [u8],
+        ) -> io::Result<usize> {
+            self.try_read(buffer)
+        }
+
+        fn send(
+            &self,
+            bytes: &[u8],
+        ) -> io::Result<usize> {
+            self.try_write(bytes)
+        }
+    }
+
+    struct Socket<'a, S>(&'a S);
+
+    impl<S: Wire> Read for Socket<'_, S> {
         fn read(
             &mut self,
             buffer: &mut [u8],
         ) -> io::Result<usize> {
-            self.0.try_read(buffer)
+            self.0.receive(buffer)
         }
     }
 
-    impl Write for Socket<'_> {
+    impl<S: Wire> Write for Socket<'_, S> {
         fn write(
             &mut self,
             bytes: &[u8],
         ) -> io::Result<usize> {
-            self.0.try_write(bytes)
+            self.0.send(bytes)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -230,17 +252,18 @@ pub(crate) mod secure {
         }
     }
 
-    pub(crate) struct Secure {
-        stream: TcpStream,
+    pub(crate) struct Secure<S> {
+        stream: S,
         session: rustls::ClientConnection,
         /// Decrypted bytes may still wait inside the session. The socket's
         /// readiness says nothing about them.
         plaintext: bool,
     }
 
-    impl Secure {
-        pub(super) async fn handshake(
-            stream: TcpStream,
+    impl<S: Wire> Secure<S> {
+        /// A session that has not exchanged a byte yet.
+        pub(in crate::http1) fn start(
+            stream: S,
             tls: &Tls,
         ) -> io::Result<Self> {
             let session = rustls::ClientConnection::new(
@@ -248,34 +271,45 @@ pub(crate) mod secure {
                 tls.name.clone(),
             )
             .map_err(io::Error::other)?;
-            let mut secure = Self { stream, session, plaintext: false };
-            while secure.session.is_handshaking() {
-                let interest = match (
-                    secure.session.wants_read(),
-                    secure.session.wants_write(),
-                ) {
-                    (true, true) => Interest::READABLE | Interest::WRITABLE,
-                    (true, false) => Interest::READABLE,
-                    (false, true) => Interest::WRITABLE,
-                    (false, false) => break,
-                };
-                let ready = secure.stream.ready(interest).await?;
-                if ready.is_writable() {
-                    secure.flush()?;
-                }
-                if ready.is_readable() && secure.session.wants_read() {
-                    match secure.receive() {
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        }
-                        other => other?,
-                    }
-                }
-            }
-            secure.flush()?;
-            Ok(secure)
+            Ok(Self { stream, session, plaintext: false })
         }
 
-        pub(super) fn negotiated(&self) -> Option<crate::Negotiated> {
+        /// Advance the handshake as far as the socket allows. `readable` and
+        /// `writable` are what the owner knows of the socket and are cleared
+        /// when it turns out to be empty or full. `Ok(true)` once the session
+        /// carries application data.
+        pub(in crate::http1) fn handshake_step(
+            &mut self,
+            readable: &mut bool,
+            writable: &mut bool,
+        ) -> io::Result<bool> {
+            while self.session.is_handshaking() {
+                let wants_write = self.session.wants_write();
+                let wants_read = self.session.wants_read();
+                if wants_write && *writable {
+                    self.flush()?;
+                    if self.session.wants_write() {
+                        *writable = false;
+                    }
+                } else if wants_read && *readable {
+                    match self.receive() {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            *readable = false;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else if wants_read || wants_write {
+                    return Ok(false);
+                } else {
+                    break;
+                }
+            }
+            self.flush()?;
+            Ok(true)
+        }
+
+        pub(in crate::http1) fn negotiated(&self) -> Option<crate::Negotiated> {
             Some(crate::Negotiated {
                 version: self.session.protocol_version()?.as_str()?,
                 cipher: self
@@ -290,7 +324,7 @@ pub(crate) mod secure {
             })
         }
 
-        pub(super) fn resumed(&self) -> bool {
+        pub(in crate::http1) fn resumed(&self) -> bool {
             matches!(
                 self.session.handshake_kind(),
                 Some(rustls::HandshakeKind::Resumed)
@@ -322,45 +356,7 @@ pub(crate) mod secure {
             Ok(())
         }
 
-        pub(super) async fn ready(
-            &mut self,
-            interest: Interest,
-        ) -> io::Result<Ready> {
-            loop {
-                if self.plaintext && interest.is_readable() {
-                    return Ok(Ready::READABLE);
-                }
-                let owed = self.session.wants_write();
-                let ready = self
-                    .stream
-                    .ready(if owed {
-                        interest | Interest::WRITABLE
-                    } else {
-                        interest
-                    })
-                    .await?;
-                if owed && ready.is_writable() {
-                    self.flush()?;
-                }
-                // Writability first pays for records already owed; only what
-                // is left of it is the caller's.
-                let mut granted = Ready::EMPTY;
-                if interest.is_readable() && ready.is_readable() {
-                    granted |= Ready::READABLE;
-                }
-                if interest.is_writable()
-                    && ready.is_writable()
-                    && !self.session.wants_write()
-                {
-                    granted |= Ready::WRITABLE;
-                }
-                if !granted.is_empty() {
-                    return Ok(granted);
-                }
-            }
-        }
-
-        pub(super) fn try_read(
+        pub(in crate::http1) fn try_read(
             &mut self,
             buffer: &mut [u8],
         ) -> io::Result<usize> {
@@ -380,7 +376,7 @@ pub(crate) mod secure {
             }
         }
 
-        pub(super) fn try_write(
+        pub(in crate::http1) fn try_write(
             &mut self,
             bytes: &[u8],
         ) -> io::Result<usize> {
@@ -395,9 +391,44 @@ pub(crate) mod secure {
         }
     }
 
+    /// The asynchronous owner: HTTP/2 framing waits on Tokio's readiness.
+    #[cfg(feature = "http2")]
+    impl Secure<TcpStream> {
+        pub(super) async fn handshake(
+            stream: TcpStream,
+            tls: &Tls,
+        ) -> io::Result<Self> {
+            let mut secure = Self::start(stream, tls)?;
+            while secure.session.is_handshaking() {
+                let interest = match (
+                    secure.session.wants_read(),
+                    secure.session.wants_write(),
+                ) {
+                    (true, true) => Interest::READABLE | Interest::WRITABLE,
+                    (true, false) => Interest::READABLE,
+                    (false, true) => Interest::WRITABLE,
+                    (false, false) => break,
+                };
+                let ready = secure.stream.ready(interest).await?;
+                if ready.is_writable() {
+                    secure.flush()?;
+                }
+                if ready.is_readable() && secure.session.wants_read() {
+                    match secure.receive() {
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        }
+                        other => other?,
+                    }
+                }
+            }
+            secure.flush()?;
+            Ok(secure)
+        }
+    }
+
     /// The same reads and writes for a caller that polls.
     #[cfg(feature = "http2")]
-    impl Secure {
+    impl Secure<TcpStream> {
         pub(super) fn poll_read(
             &mut self,
             cx: &mut std::task::Context<'_>,

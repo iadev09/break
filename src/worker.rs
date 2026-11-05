@@ -2,10 +2,13 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+#[cfg(feature = "http2")]
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::{mpsc as async_mpsc, watch};
 
-use crate::http1::{Client, Connection, Prepared, Window, run_slot};
+use crate::http1::Prepared;
+#[cfg(feature = "http2")]
+use crate::http1::{Client, Window, run_owner};
 use crate::{
     BreakReason, CancellationToken, Counts, LatencyStats, LoadStats, Phase,
     Setups,
@@ -78,42 +81,22 @@ impl Workers {
             .map_err(|_| BreakReason::Resources("CPU readiness handles"))?;
         for index in 0..count {
             let client = prepared.client();
-            let mut slots = Vec::new();
-            let slots_count =
+            let kept =
                 connections / count + usize::from(index < connections % count);
-            slots
-                .try_reserve(slots_count)
-                .map_err(|_| BreakReason::Resources("connection owners"))?;
-            slots.resize_with(slots_count, || None);
             let stop = owner.stop.clone();
             let (commands, receiver) = async_mpsc::unbounded_channel();
             let (ready, waiting) = mpsc::channel();
             let thread = thread::Builder::new()
                 .name(format!("brk-{index}"))
                 .spawn(move || {
-                    let runtime =
-                        match tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                        {
-                            Ok(runtime) => runtime,
-                            Err(error) => {
-                                let _ = ready.send(Err(error));
-                                return;
-                            }
-                        };
-                    let _ = ready.send(Ok(()));
-                    // The worker is the only task on its runtime and all of
-                    // its connections are futures inside it. Tokio's
-                    // cooperative budget is counted per task, so they would
-                    // share one: once it is spent every connection is
-                    // refused until the task yields, and the connections
-                    // answered first return ahead of the ones still
-                    // waiting, which then starve. Their order is the
-                    // connection set's own, first woken first polled.
-                    runtime.block_on(tokio::task::unconstrained(serve(
-                        client, slots, receiver, stop,
-                    )));
+                    // HTTP/2 framing is driven through polls and keeps
+                    // Tokio's runtime; HTTP/1.1 has a readiness loop of its
+                    // own.
+                    #[cfg(feature = "http2")]
+                    if client.http2.is_some() {
+                        return framed(client, kept, receiver, stop, ready);
+                    }
+                    crate::http1::serve(client, kept, receiver, stop, ready);
                 })?;
             owner.workers.push(Worker { commands, thread: Some(thread) });
             startup.push(waiting);
@@ -170,9 +153,48 @@ pub(crate) fn receive<T>(reply: Receiver<T>) -> Result<T, BreakReason> {
     reply.recv().map_err(|_| BreakReason::Worker("reply channel closed"))
 }
 
+/// A worker thread for a protocol driven through polls: one Tokio runtime,
+/// its owners futures of the one task on it.
+#[cfg(feature = "http2")]
+fn framed(
+    client: Client,
+    kept: usize,
+    receiver: async_mpsc::UnboundedReceiver<Command>,
+    stop: CancellationToken,
+    ready: Sender<std::io::Result<()>>,
+) {
+    let mut slots = Vec::new();
+    if slots.try_reserve(kept).is_err() {
+        let _ = ready.send(Err(std::io::ErrorKind::OutOfMemory.into()));
+        return;
+    }
+    slots.resize_with(kept, || None);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(()));
+    // The worker is the only task on its runtime and all of its connections
+    // are futures inside it. Tokio's cooperative budget is counted per task,
+    // so they would share one: once it is spent every connection is refused
+    // until the task yields, and the connections answered first return ahead
+    // of the ones still waiting, which then starve. Their order is the
+    // connection set's own, first woken first polled.
+    runtime.block_on(tokio::task::unconstrained(serve(
+        client, slots, receiver, stop,
+    )));
+}
+
+#[cfg(feature = "http2")]
 async fn serve(
     client: Client,
-    mut slots: Vec<Option<Connection>>,
+    mut slots: Vec<Option<crate::http2::Connection>>,
     mut commands: async_mpsc::UnboundedReceiver<Command>,
     stop: CancellationToken,
 ) {
@@ -211,7 +233,7 @@ async fn serve(
                 pending.push(async move {
                     (
                         index,
-                        run_slot(client, connection, window, stop, phase_stop)
+                        run_owner(client, connection, window, stop, phase_stop)
                             .await,
                     )
                 });

@@ -22,27 +22,43 @@
 
 ## Execution
 
-- `src/worker.rs`: available-CPU current-thread Tokio executors, capped by the
-  fixed connection count. Each owns its connections and phase-local counters.
-  Channels carry phase commands/results, not individual requests.
+- `src/worker.rs`: one thread for every CPU the process may run on, or the
+  declared number, capped by the fixed connection count. Each owns its
+  connections and phase-local counters. Channels carry phase commands/results,
+  not individual requests. An HTTP/1.1 worker runs the engine below; an HTTP/2
+  worker runs a current-thread Tokio executor, because that framing is driven
+  through polls. That executor's one task runs outside Tokio's cooperative
+  budget: the budget is per task, and shared by a thread's connections it
+  starved the ones not answered first.
 - `src/http1.rs`: target validation, cold address resolution and reusable GET
   bytes. Transport-specific preparation remains behind the root API.
-- `src/http1/connection.rs`: actual HTTP/1 pipelining, partial writes, readiness,
-  FIFO request deadlines and connection replacement. One persistent future per
-  connection; no per-request task or shared request counter. A response releases
-  its slot only after complete-body validation. Socket-read chunks are not payload
-  or concurrency limits. Declared phase/deadline timers do not pace requests.
-  A worker's connections are futures of one task, polled in the order they are
-  woken. That task runs outside Tokio's cooperative budget: the budget is per
-  task, and shared by many connections it starved the ones not answered first.
-  Fully sent requests
+- `src/http1/engine.rs`: the HTTP/1.1 readiness loop of a worker thread. It
+  asks the kernel which sockets changed, remembers each socket's readable and
+  writable side until a read finds nothing or a write finds no room, and turns
+  the owners that have work in the order the work arrived. There is no task,
+  waker or timer per connection or request, and nothing shared between threads
+  on the request path. Deadlines wait in one queue per thread; every request
+  has the same budget, so the order they were set in is the order they fall
+  due. The coordinator's channel, start signal and cancellation tokens are
+  waited on with a waker that interrupts the loop, and what the tokens say is
+  read once per interruption. An owner establishes its connection (TCP, then
+  TLS), drives it, replaces it when it ends and accounts for each.
+- `src/http1/connection.rs`: actual HTTP/1 pipelining, partial writes, FIFO
+  request deadlines and what ends a connection, as a state the engine turns.
+  One turn does what was due, one read and the requests its free slots admit,
+  then says whether it waits or has more. No per-request task or shared request
+  counter. A response releases its slot only after complete-body validation.
+  Socket-read chunks are not payload or concurrency limits. Declared
+  phase/deadline timers do not pace requests. Fully sent requests
   enter the load integral; complete responses or retirement leave it. Expired
   attempts, direct transport failures and unexpired abandoned followers remain
-  distinct failed outcomes. TCP setup failures are counted separately.
+  distinct failed outcomes. TCP setup failures are counted separately. The
+  owner loop for protocols driven through polls lives here too.
 - `src/http1/transport.rs`: what carries a connection's bytes. A TCP stream, or
   the same stream under TLS for an `https://` target (`tls` feature). Both expose
-  socket readiness and non-blocking reads and writes, so the connection loop does
-  not know which it drives. The TLS session is driven directly on that readiness:
+  non-blocking reads and writes, so the connection loop does not know which it
+  drives. The TLS session is one type over the engine's sockets and Tokio's,
+  and is driven directly on their readiness:
   records already owed are written before new request bytes are accepted, and
   decrypted bytes still held by the session are reported readable without
   waiting for the socket. The handshake completes inside connection setup.

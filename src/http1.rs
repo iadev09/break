@@ -1,5 +1,6 @@
 mod connection;
 mod decode;
+mod engine;
 mod transport;
 
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -10,55 +11,10 @@ use http::{StatusCode, Uri};
 
 use crate::{BreakReason, Counts};
 #[cfg(feature = "http2")]
-pub(crate) use connection::{Carrier, End, open};
-pub(crate) use connection::{Summary, Window, run_owner};
+pub(crate) use connection::{Carrier, End, Summary, Window, open, run_owner};
+pub(crate) use engine::serve;
 #[cfg(feature = "http2")]
 pub(crate) use transport::{Sessions, Transport};
-
-/// A kept connection of whichever protocol the target speaks.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "an HTTP/1.1 connection stays inline in its owner's slot, as it was before another protocol existed; every slot of a run holds the same variant"
-)]
-pub(crate) enum Connection {
-    H1(connection::Connection),
-    #[cfg(feature = "http2")]
-    H2(Box<crate::http2::Connection>),
-}
-
-impl Connection {
-    fn into_h1(self) -> Option<connection::Connection> {
-        match self {
-            Self::H1(kept) => Some(kept),
-            #[cfg(feature = "http2")]
-            Self::H2(_) => None,
-        }
-    }
-}
-
-/// Run one owner for a phase over the target's protocol.
-pub(crate) async fn run_slot(
-    client: &Client,
-    kept: Option<Connection>,
-    window: Window,
-    stop: &tokio_util::sync::CancellationToken,
-    phase_stop: &tokio_util::sync::CancellationToken,
-) -> (Option<Connection>, Summary) {
-    #[cfg(feature = "http2")]
-    if client.http2.is_some() {
-        let kept = kept.and_then(|kept| match kept {
-            Connection::H2(kept) => Some(*kept),
-            Connection::H1(_) => None,
-        });
-        let (kept, summary) =
-            run_owner(client, kept, window, stop, phase_stop).await;
-        return (kept.map(|kept| Connection::H2(Box::new(kept))), summary);
-    }
-    let kept = kept.and_then(Connection::into_h1);
-    let (kept, summary) =
-        run_owner(client, kept, window, stop, phase_stop).await;
-    (kept.map(Connection::H1), summary)
-}
 
 /// One GET target and optional exact response validation.
 ///

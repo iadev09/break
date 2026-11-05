@@ -59,7 +59,10 @@ h2 = { version = "0.4", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 
-# Executor and asynchronous operations
+# The HTTP/1.1 readiness loop
+mio = { version = "1", features = ["os-poll", "net"] }
+
+# Coordination, and the executor HTTP/2 framing runs on
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
