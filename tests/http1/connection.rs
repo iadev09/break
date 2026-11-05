@@ -121,13 +121,19 @@ fn a_reply_waiting_in_the_socket_past_its_deadline_is_read_not_abandoned() {
         began: now - Duration::from_secs(2),
     });
     let mut timers = VecDeque::new();
-    let mut turn =
-        Turn { client: &client, window, halted: false, timers: &mut timers, owner: 0 };
+    let mut turn = Turn {
+        client: &client,
+        window,
+        halted: false,
+        timers: &mut timers,
+        owner: 0,
+    };
     let mut flags = Flags { readable: true, writable: true, ended: false };
     let mut summary = Summary::default();
     let mut meter = Meter::new(window.start, window.duration, 1);
 
-    let step = connection.exchange(&mut turn, &mut flags, &mut summary, &mut meter);
+    let step =
+        connection.exchange(&mut turn, &mut flags, &mut summary, &mut meter);
 
     // A late reply: counted as one, timed, and the connection is kept.
     assert!(matches!(step, Step::End(End::Retain)));

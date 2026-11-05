@@ -506,11 +506,13 @@ impl Conn {
                                 now + window.timeout
                             }
                         };
-                        self.pending.push_back(Attempt { deadline, began: now });
+                        self.pending
+                            .push_back(Attempt { deadline, began: now });
                     }
                     if timed {
                         // One entry wakes the owner for all of them.
-                        turn.timers.push_back((now + window.timeout, turn.owner));
+                        turn.timers
+                            .push_back((now + window.timeout, turn.owner));
                     }
                     self.writing = Some(Writing {
                         offset: 0,

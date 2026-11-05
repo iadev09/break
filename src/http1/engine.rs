@@ -24,7 +24,9 @@ use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::connection::{Conn, End, Flags, Step, Stream, Summary, Turn, Window};
+use super::connection::{
+    Conn, End, Flags, Step, Stream, Summary, Turn, Window,
+};
 #[cfg(feature = "tls")]
 use super::transport::secure::Secure;
 use super::transport::{Sessions, own_sessions};
@@ -175,7 +177,8 @@ impl Owner {
         if let Some(meter) = self.meter.take() {
             self.summary.load = meter.finish(Instant::now());
         }
-        self.summary.at_target = self.summary.load.latest_first_target.is_some();
+        self.summary.at_target =
+            self.summary.load.latest_first_target.is_some();
         self.done = true;
         Turned::Done
     }
@@ -539,7 +542,8 @@ struct Engine {
 impl Engine {
     fn new(kept: usize) -> io::Result<Self> {
         let poll = Poll::new()?;
-        let signal = Arc::new(Signal(mio::Waker::new(poll.registry(), SIGNAL)?));
+        let signal =
+            Arc::new(Signal(mio::Waker::new(poll.registry(), SIGNAL)?));
         let mut owners = Vec::new();
         owners.try_reserve(kept).map_err(|_| io::ErrorKind::OutOfMemory)?;
         owners.resize_with(kept, Owner::default);
@@ -655,7 +659,8 @@ impl Engine {
             self.owners.clear();
             if self.owners.try_reserve(churn.owners).is_err() {
                 command.phase_stop.cancel();
-                total.failure = Some(BreakReason::Resources("connection owners"));
+                total.failure =
+                    Some(BreakReason::Resources("connection owners"));
                 return total;
             }
             self.owners.resize_with(churn.owners, Owner::default);

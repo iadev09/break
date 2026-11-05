@@ -203,7 +203,8 @@ fn execute(
         Raises::Depth { connections } => (connections, connections),
         Raises::Owners { .. } => (ramp.max.unwrap_or(usize::MAX), 0),
     };
-    let workers = Workers::start(&prepared, owners, kept, ramp.threads, stop.clone())?;
+    let workers =
+        Workers::start(&prepared, owners, kept, ramp.threads, stop.clone())?;
     stats.cpu_workers = workers.len();
     observer.workers_started(workers.len());
     let result = phases(&workers, ramp, acceptance, &stop, observer, stats);
