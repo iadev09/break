@@ -226,6 +226,14 @@ impl Broken {
 
 /// Runs on the caller at phase boundaries, never on the request path.
 pub trait Observer {
+    /// The run's worker threads are ready. Called once, before the first
+    /// phase. Their number follows the CPUs the process may run on.
+    fn workers_started(
+        &mut self,
+        _cpu_workers: usize,
+    ) {
+    }
+
     /// Workers are ready but no request from this phase has been sent.
     fn phase_started(
         &mut self,

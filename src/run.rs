@@ -191,6 +191,7 @@ fn execute(
     };
     let workers = Workers::start(&prepared, owners, kept, stop.clone())?;
     stats.cpu_workers = workers.len();
+    observer.workers_started(workers.len());
     let result = phases(&workers, ramp, acceptance, &stop, observer, stats);
     let finished = workers.finish();
     result.and(finished)

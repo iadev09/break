@@ -391,8 +391,14 @@ fn initial_connection_failure_returns_broken_with_paired_callbacks() {
     drop(listener);
     let target = Target::new(&format!("http://{address}/plain")).unwrap();
     #[derive(Default)]
-    struct Events(Vec<bool>);
+    struct Events(Vec<bool>, Vec<usize>);
     impl Observer for Events {
+        fn workers_started(
+            &mut self,
+            cpu_workers: usize,
+        ) {
+            self.1.push(cpu_workers);
+        }
         fn phase_started(
             &mut self,
             _: &Phase,
@@ -421,6 +427,8 @@ fn initial_connection_failure_returns_broken_with_paired_callbacks() {
     .unwrap_err();
     assert!(matches!(broken.reason, BreakReason::Io(_)));
     assert_eq!(events.0, [true, false]);
+    // One connection is owned by one worker thread, announced once.
+    assert_eq!(events.1, [1]);
     assert!(broken.stats.last_accepted.is_none());
     assert_eq!(broken.stats.total.sent, 0);
     assert_eq!(broken.stats.total.connect, 1);

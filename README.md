@@ -60,7 +60,21 @@ Phase zero targets `conn × start` requests. Phase `n` targets
 allows its replacement. Requests/s is measured, not configured. Counters reset
 per phase; pending requests retain their original phase and deadline during drain.
 There is no warmup, scenario-file loader or thread-count flag. CPU workers are
-selected automatically from available parallelism and the connection count.
+selected automatically from available parallelism and the connection count,
+and the run prints how many it started. Available parallelism follows the
+process's CPU affinity and cgroup quota where the platform has them. On Linux
+the CPUs given to the process therefore bound both how many worker threads run
+and where:
+
+```sh
+# Eight worker threads on CPUs 32 to 39, away from a local server on 0 to 31.
+taskset -c 32-39 brk http://127.0.0.1:8080/plain --conn 1024 --pace 1 \
+  --phase 60s --timeout 100ms
+```
+
+A client that shares CPUs with the server it measures competes with it, and
+the boundary it finds belongs to both. A thread-count flag alone would not
+separate them; the CPU set does.
 
 The adapter implements HTTP/1.1 GET with actual pipelining on each connection.
 It reads ordered responses while filling free request slots, reuses connections
@@ -225,7 +239,8 @@ let result = brk::run(&target, plan, &CancellationToken::new(), &mut Measurement
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-`phase_started` runs after worker readiness and before phase traffic, including
+`workers_started` runs once, when the worker threads are ready, with their
+number. `phase_started` runs after worker readiness and before phase traffic, including
 connection setup. `phase_finished` runs after every admitted attempt has finished
 or timed out, including rejected and cancelled phases. DNS and CPU-worker startup
 are outside these callbacks. The callbacks run synchronously on the caller, never

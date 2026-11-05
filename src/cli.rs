@@ -366,6 +366,13 @@ impl Printer {
 }
 
 impl Observer for Printer {
+    fn workers_started(
+        &mut self,
+        cpu_workers: usize,
+    ) {
+        println!("Client: {cpu_workers} worker threads");
+    }
+
     fn phase_started(
         &mut self,
         phase: &Phase,
