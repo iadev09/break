@@ -320,7 +320,6 @@ impl Connection {
         let timer = tokio::time::sleep_until(armed.into());
         tokio::pin!(stopped, phase_stopped, timer);
         loop {
-            tokio::task::consume_budget().await;
             let now = Instant::now();
             let admitting =
                 now < end && !stop.is_cancelled() && !phase_stop.is_cancelled();
@@ -470,13 +469,9 @@ impl Connection {
                     && self.remaining != Some(0));
             if can_write && !self.blocked {
                 let mut wake = Some(now);
+                // A burst ends with the free slots or with a full socket;
+                // reads are served again before the next one.
                 loop {
-                    // Use Tokio's own cooperative quantum, not an invented batch limit.
-                    // Returning to the outer loop services reads before another write burst.
-                    if !tokio::task::coop::has_budget_remaining() {
-                        break;
-                    }
-                    tokio::task::consume_budget().await;
                     // The first write of a burst is at the wake's own time;
                     // later ones read the clock, so a long burst does not
                     // date its requests early.

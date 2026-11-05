@@ -196,8 +196,9 @@ acceptance thresholds. No undisclosed load tolerance is applied.
 
 Setup attempts/time, blocked writes, maximum send delay and deadline-observation
 lateness expose generator pressure. They do not independently identify server
-time, network time or client scheduling delay. Write bursts share Tokio's
-cooperative budget with reads and the other connection owners.
+time, network time or client scheduling delay. A worker thread polls its
+connections in the order they are woken; a write burst ends with the free
+request slots or with a full socket, and reads are served before the next.
 
 `timeout`, `transport`, `abandoned`, `connect`, `connect-timeout`, `status` and
 `body` are separate failed-attempt categories. Retiring an ordered connection

@@ -32,7 +32,10 @@
   connection; no per-request task or shared request counter. A response releases
   its slot only after complete-body validation. Socket-read chunks are not payload
   or concurrency limits. Declared phase/deadline timers do not pace requests.
-  Reads and write bursts share Tokio's cooperative budget. Fully sent requests
+  A worker's connections are futures of one task, polled in the order they are
+  woken. That task runs outside Tokio's cooperative budget: the budget is per
+  task, and shared by many connections it starved the ones not answered first.
+  Fully sent requests
   enter the load integral; complete responses or retirement leave it. Expired
   attempts, direct transport failures and unexpired abandoned followers remain
   distinct failed outcomes. TCP setup failures are counted separately.

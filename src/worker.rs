@@ -103,7 +103,17 @@ impl Workers {
                             }
                         };
                     let _ = ready.send(Ok(()));
-                    runtime.block_on(serve(client, slots, receiver, stop));
+                    // The worker is the only task on its runtime and all of
+                    // its connections are futures inside it. Tokio's
+                    // cooperative budget is counted per task, so they would
+                    // share one: once it is spent every connection is
+                    // refused until the task yields, and the connections
+                    // answered first return ahead of the ones still
+                    // waiting, which then starve. Their order is the
+                    // connection set's own, first woken first polled.
+                    runtime.block_on(tokio::task::unconstrained(serve(
+                        client, slots, receiver, stop,
+                    )));
                 })?;
             owner.workers.push(Worker { commands, thread: Some(thread) });
             startup.push(waiting);
