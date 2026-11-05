@@ -50,8 +50,8 @@ Exit codes: `0` Done, `1` Broken, `2` argument parsing errors, `130` Ctrl-C.
 - `--max`: optional per-connection ceiling. Without it there is no fixed final
   phase. Reaching it reports tested load, not a server breakpoint.
 - `--expect-body`: additionally require an exact response body.
-- `--threads`: client worker threads; by default one for every CPU the process
-  may run on, never more than there are connections.
+- `--threads`: client worker threads. Not part of the load; see
+  [What `--threads` is](#what---threads-is).
 - `--connect`: connect to this address instead of resolving the URL's host. The
   URL still supplies the `Host` header and, for `https://`, the server name.
 - `--cacert`: for `https://`, trust the authorities in this PEM file instead of
@@ -61,17 +61,43 @@ Phase zero targets `conn × start` requests. Phase `n` targets
 `conn × (start + n × pace)`. A completed request frees one slot and immediately
 allows its replacement. Requests/s is measured, not configured. Counters reset
 per phase; pending requests retain their original phase and deadline during drain.
-There is no warmup or scenario-file loader. The run prints how many worker
-threads it started. `--threads` declares their number; without it there is one
-for every CPU the process may run on, which follows the process's CPU affinity
-and cgroup quota where the platform has them. There are never more threads
-than connections.
+There is no warmup or scenario-file loader.
 
-By default the client takes every CPU, so that what gives way under load is
-the server and not the client. On the server's own machine the two then share
-the CPUs, and the boundary found belongs to both: use it to compare servers
-under the same conditions, not as one server's capacity. A thread count is a
-number of threads; it reserves no CPU for either side.
+### What `--threads` is
+
+The load is what you declare with `--conn`, `--start` and `--pace`: how many
+requests, or connections, are outstanding at once. That is what the server is
+asked to carry and what the SLA is judged on.
+
+`--threads` is not part of it. The same connections carry the same concurrency
+whether two threads drive them or forty. It is not a criterion of the
+measurement and not something to tune for a better number: it only bounds how
+much of the machine the client may use while it drives the declared load. It
+exists so that a run is possible at all where client and server share a
+machine.
+
+- **Without it** there is one thread for every CPU the process may run on
+  (following CPU affinity and cgroup quota where the platform has them), never
+  more than there are connections. That suits a client with a machine of its
+  own.
+- **On the server's own machine** that default puts a full set of client
+  threads beside the server's. The machine is then crowded, the client's own
+  deadlines are noticed late, and the box gives way before the SLA does.
+  Declare fewer.
+- **Too few** and the client becomes the side that gives way: it cannot keep
+  the declared concurrency outstanding.
+
+The output says which of these a run was. `target-coverage` near 100% means the
+client kept the declared load outstanding. `max-deadline-lateness` small beside
+`--timeout` means the client observed its deadlines on time. While both hold,
+the result does not depend on the thread count, which is the sign that the
+count was a condition of the run and not a part of the measurement. Report it
+that way, beside the machine, never as a load parameter.
+
+A thread count reserves no CPU and pins nothing. On a shared machine the
+boundary found belongs to client and server together: use it to compare
+servers under the same conditions, not as one server's capacity. The run prints
+how many worker threads it started.
 
 The adapter implements HTTP/1.1 GET with actual pipelining on each connection.
 Requests admitted together are written together: one write carries as many as
