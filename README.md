@@ -95,9 +95,11 @@ can repeat.
 The output says which of these a run was. `target-coverage` near 100% means the
 client kept the declared load outstanding. `max-deadline-lateness` small beside
 `--timeout` means the client observed its deadlines on time. While both hold,
-the result does not depend on the thread count, which is the sign that the
-count was a condition of the run and not a part of the measurement. Report it
-that way, beside the machine, never as a load parameter.
+whether a level is accepted does not depend on the thread count, which is the
+sign that the count was a condition of the run and not a part of the
+measurement. Report it that way, beside the machine, never as a load parameter.
+The rate at that level can still be the client's; see
+[Known limits](#known-limits).
 
 A thread count reserves no CPU and pins nothing. On a shared machine the
 boundary found belongs to client and server together: use it to compare
@@ -206,8 +208,6 @@ Those client/protocol failures do not establish server capacity.
 
 ## Load diagnostics
 
-These diagnostics are available from source; crates.io 0.1.0 does not include them.
-
 Each phase reports its target and observed mean outstanding requests. The mean is
 the time integral of fully written requests awaiting complete responses, divided
 by the active phase time. Setup gaps and connection replacement remain visible;
@@ -238,6 +238,29 @@ An initial rejection establishes no passing baseline. A rejection after a passin
 phase brackets this run's observed boundary, at the declared pace resolution.
 The runner does not repeat, refine or claim a confidence interval. An explicit
 `--max` is tested even when it lies between normal pace levels.
+
+## Known limits
+
+- **HTTP/2 costs the client several times what HTTP/1.1 does.** Its framing
+  still runs on Tokio with a timer for every stream, where HTTP/1.1 has a
+  readiness loop of its own. On one 40-CPU Linux machine, over TLS, a request
+  cost the client about 16 µs of CPU at 16 streams a connection, against
+  three to four over HTTP/1.1. Give an HTTP/2 run more client threads, and
+  read its rate with the next point in mind. A cheaper HTTP/2 path is
+  intended and is not the priority.
+- **The rate can be the client's while every diagnostic is clean.** A client
+  whose threads are full still keeps the declared requests outstanding and
+  still reads their responses within the deadline, only later. Coverage stays
+  near 100%, lateness stays small and the phase is accepted. The verdict on
+  that level stands; requests/s then describes the client, not the server.
+  `brk` does not report its own CPU use: measure the process, or read it at
+  the phase boundaries through the library, and compare it with the thread
+  count.
+- **Over TLS, HTTP/1.1 makes one read that finds nothing for each response.**
+  That is client cost only and changes no outcome.
+- **The request is a fixed GET.** No request body, no headers of your own, no
+  scenario file, no warmup.
+- **It has been run on Linux and macOS.** Nothing else has been tried.
 
 ## Library
 
