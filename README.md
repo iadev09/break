@@ -67,19 +67,11 @@ for every CPU the process may run on, which follows the process's CPU affinity
 and cgroup quota where the platform has them. There are never more threads
 than connections.
 
-A client that shares CPUs with the server it measures competes with it, and
-the boundary it finds belongs to both. On one machine, declare both sides so
-that the server's threads and the client's fit the CPUs together:
-
-```sh
-# A local server with 32 worker threads on a 40-CPU machine.
-brk http://127.0.0.1:8080/plain --threads 8 --conn 1024 --pace 1 \
-  --phase 60s --timeout 100ms
-```
-
-`--threads` bounds how much CPU the client can take, not where it runs. To
-keep the two sides on separate CPUs, give each its own set with the
-platform's tool, such as `taskset` on Linux.
+By default the client takes every CPU, so that what gives way under load is
+the server and not the client. On the server's own machine the two then share
+the CPUs, and the boundary found belongs to both: use it to compare servers
+under the same conditions, not as one server's capacity. A thread count is a
+number of threads; it reserves no CPU for either side.
 
 The adapter implements HTTP/1.1 GET with actual pipelining on each connection.
 Requests admitted together are written together: one write carries as many as
