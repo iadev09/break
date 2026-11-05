@@ -285,6 +285,13 @@ impl Target {
             }
         }
         let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        // A process's first random bytes initialise the provider's entropy
+        // source, which takes tens of milliseconds. That is client startup:
+        // pay it here and not inside the first connections' setup deadline.
+        provider
+            .secure_random
+            .fill(&mut [0_u8; 32])
+            .map_err(|_| BreakReason::Resources("TLS randomness"))?;
         if let Some(group) = self.offer.group {
             provider.kx_groups = vec![group];
         }
