@@ -53,14 +53,20 @@ pub(crate) struct Workers {
 
 impl Workers {
     /// `owners` bounds the worker threads; `connections` of them are kept
-    /// open across phases. The connection test keeps none.
+    /// open across phases. The connection test keeps none. Without declared
+    /// `threads` there is one for every CPU the process may run on.
     pub fn start(
         prepared: &Prepared,
         owners: usize,
         connections: usize,
+        threads: Option<usize>,
         stop: CancellationToken,
     ) -> Result<Self, BreakReason> {
-        let count = thread::available_parallelism()?.get().min(owners);
+        let threads = match threads {
+            Some(threads) => threads,
+            None => thread::available_parallelism()?.get(),
+        };
+        let count = threads.min(owners);
         let mut owner = Self { workers: Vec::new(), stop };
         owner
             .workers

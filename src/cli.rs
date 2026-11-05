@@ -71,6 +71,10 @@ struct Common {
     #[cfg(feature = "http2")]
     #[arg(long)]
     http2: bool,
+    /// Client worker threads. By default one for every CPU the process may
+    /// run on; never more than there are connections.
+    #[arg(long, value_name = "COUNT")]
+    threads: Option<usize>,
     /// Time at each level, for example 10s.
     #[arg(long, value_parser = humantime::parse_duration)]
     phase: Duration,
@@ -317,6 +321,7 @@ fn execute(test: Test) -> Result<crate::Done, Broken> {
                 timeout: args.common.timeout,
                 accept: args.common.accept,
                 max_concurrency: args.max_concurrency,
+                threads: args.common.threads,
             };
             let acceptance = plan.validate().map_err(setup_error)?;
             interrupt()?;
@@ -337,6 +342,7 @@ fn execute(test: Test) -> Result<crate::Done, Broken> {
                 timeout: args.common.timeout,
                 accept: args.common.accept,
                 max_owners: args.max_owners,
+                threads: args.common.threads,
             };
             let acceptance = plan.validate().map_err(setup_error)?;
             interrupt()?;

@@ -195,6 +195,7 @@ fn plan() -> Plan {
         timeout: Duration::from_secs(2),
         accept: 99.99,
         max_concurrency: Some(2),
+        threads: None,
     }
 }
 
@@ -241,12 +242,14 @@ fn start_and_pace_are_per_connection_and_callbacks_surround_drained_phases() {
     };
     let broken = brk::run(
         &fixture.target(),
-        Plan { max_concurrency: None, ..plan() },
+        Plan { max_concurrency: None, threads: Some(1), ..plan() },
         &CancellationToken::new(),
         &mut observer,
     )
     .unwrap_err();
     assert!(matches!(broken.reason, BreakReason::Acceptance));
+    // One declared thread owns both connections.
+    assert_eq!(broken.stats.cpu_workers, 1);
     assert_eq!(observer.events, [(true, 0), (false, 0), (true, 1), (false, 1)]);
     assert_eq!(observer.phases[0].phase.requests_per_connection, 2);
     assert_eq!(observer.phases[0].phase.total_concurrency, 4);

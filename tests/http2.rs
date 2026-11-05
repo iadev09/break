@@ -150,6 +150,7 @@ fn plan() -> Plan {
         timeout: Duration::from_secs(2),
         accept: 99.99,
         max_concurrency: Some(8),
+        threads: None,
     }
 }
 
@@ -214,6 +215,7 @@ fn the_connection_test_replaces_connections_after_their_streams() {
             timeout: Duration::from_secs(2),
             accept: 99.99,
             max_owners: Some(2),
+            threads: None,
         };
         let done = brk::run_connections(
             &fixture.target(),

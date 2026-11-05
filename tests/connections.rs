@@ -124,6 +124,7 @@ fn plan() -> ConnectionPlan {
         timeout: Duration::from_secs(2),
         accept: 99.99,
         max_owners: Some(4),
+        threads: None,
     }
 }
 

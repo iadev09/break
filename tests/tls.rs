@@ -142,6 +142,7 @@ fn plan() -> Plan {
         timeout: Duration::from_secs(2),
         accept: 99.99,
         max_concurrency: Some(2),
+        threads: None,
     }
 }
 
@@ -194,6 +195,7 @@ fn a_returning_owner_resumes_its_own_session_unless_told_not_to() {
             timeout: Duration::from_secs(2),
             accept: 99.99,
             max_owners: Some(2),
+            threads: None,
         };
         let done = brk::run_connections(
             &target,

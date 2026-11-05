@@ -50,6 +50,8 @@ Exit codes: `0` Done, `1` Broken, `2` argument parsing errors, `130` Ctrl-C.
 - `--max`: optional per-connection ceiling. Without it there is no fixed final
   phase. Reaching it reports tested load, not a server breakpoint.
 - `--expect-body`: additionally require an exact response body.
+- `--threads`: client worker threads; by default one for every CPU the process
+  may run on, never more than there are connections.
 - `--connect`: connect to this address instead of resolving the URL's host. The
   URL still supplies the `Host` header and, for `https://`, the server name.
 - `--cacert`: for `https://`, trust the authorities in this PEM file instead of
@@ -59,22 +61,25 @@ Phase zero targets `conn × start` requests. Phase `n` targets
 `conn × (start + n × pace)`. A completed request frees one slot and immediately
 allows its replacement. Requests/s is measured, not configured. Counters reset
 per phase; pending requests retain their original phase and deadline during drain.
-There is no warmup, scenario-file loader or thread-count flag. CPU workers are
-selected automatically from available parallelism and the connection count,
-and the run prints how many it started. Available parallelism follows the
-process's CPU affinity and cgroup quota where the platform has them. On Linux
-the CPUs given to the process therefore bound both how many worker threads run
-and where:
+There is no warmup or scenario-file loader. The run prints how many worker
+threads it started. `--threads` declares their number; without it there is one
+for every CPU the process may run on, which follows the process's CPU affinity
+and cgroup quota where the platform has them. There are never more threads
+than connections.
+
+A client that shares CPUs with the server it measures competes with it, and
+the boundary it finds belongs to both. On one machine, declare both sides so
+that the server's threads and the client's fit the CPUs together:
 
 ```sh
-# Eight worker threads on CPUs 32 to 39, away from a local server on 0 to 31.
-taskset -c 32-39 brk http://127.0.0.1:8080/plain --conn 1024 --pace 1 \
+# A local server with 32 worker threads on a 40-CPU machine.
+brk http://127.0.0.1:8080/plain --threads 8 --conn 1024 --pace 1 \
   --phase 60s --timeout 100ms
 ```
 
-A client that shares CPUs with the server it measures competes with it, and
-the boundary it finds belongs to both. A thread-count flag alone would not
-separate them; the CPU set does.
+`--threads` bounds how much CPU the client can take, not where it runs. To
+keep the two sides on separate CPUs, give each its own set with the
+platform's tool, such as `taskset` on Linux.
 
 The adapter implements HTTP/1.1 GET with actual pipelining on each connection.
 It reads ordered responses while filling free request slots, reuses connections
@@ -233,7 +238,7 @@ let plan = Plan {
     conn: 64, start: 2, pace: 2,
     phase_duration: Duration::from_secs(10),
     timeout: Duration::from_millis(16),
-    accept: 99.99, max_concurrency: Some(8),
+    accept: 99.99, max_concurrency: Some(8), threads: None,
 };
 let result = brk::run(&target, plan, &CancellationToken::new(), &mut Measurements);
 # Ok::<(), Box<dyn std::error::Error>>(())

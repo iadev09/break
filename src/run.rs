@@ -20,6 +20,9 @@ pub struct Plan {
     pub accept: f64,
     /// Optional per-connection ceiling; it does not assert a server breakpoint.
     pub max_concurrency: Option<usize>,
+    /// Client worker threads. `None` is one for every CPU the process may run
+    /// on. Never more than there are connections.
+    pub threads: Option<usize>,
 }
 
 impl Plan {
@@ -39,6 +42,7 @@ impl Plan {
             start: self.start,
             pace: self.pace,
             max: self.max_concurrency,
+            threads: self.threads,
             phase_duration: self.phase_duration,
             timeout: self.timeout,
         }
@@ -62,6 +66,9 @@ pub struct ConnectionPlan {
     pub accept: f64,
     /// Optional ceiling on owners; it does not assert a server breakpoint.
     pub max_owners: Option<usize>,
+    /// Client worker threads. `None` is one for every CPU the process may run
+    /// on. Never more than there are connections.
+    pub threads: Option<usize>,
 }
 
 impl ConnectionPlan {
@@ -80,6 +87,7 @@ impl ConnectionPlan {
             start: self.start,
             pace: self.pace,
             max: self.max_owners,
+            threads: self.threads,
             phase_duration: self.phase_duration,
             timeout: self.timeout,
         }
@@ -101,6 +109,7 @@ struct Ramp {
     start: usize,
     pace: usize,
     max: Option<usize>,
+    threads: Option<usize>,
     phase_duration: Duration,
     timeout: Duration,
 }
@@ -113,6 +122,11 @@ impl Ramp {
         if self.phase_duration.is_zero() || self.timeout.is_zero() {
             return Err(BreakReason::Invalid(
                 "phase and timeout must be greater than zero",
+            ));
+        }
+        if self.threads == Some(0) {
+            return Err(BreakReason::Invalid(
+                "threads must be greater than zero",
             ));
         }
         if self.max.is_some_and(|max| max < self.start) {
@@ -189,7 +203,7 @@ fn execute(
         Raises::Depth { connections } => (connections, connections),
         Raises::Owners { .. } => (ramp.max.unwrap_or(usize::MAX), 0),
     };
-    let workers = Workers::start(&prepared, owners, kept, stop.clone())?;
+    let workers = Workers::start(&prepared, owners, kept, ramp.threads, stop.clone())?;
     stats.cpu_workers = workers.len();
     observer.workers_started(workers.len());
     let result = phases(&workers, ramp, acceptance, &stop, observer, stats);
@@ -353,6 +367,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             accept: 99.99,
             max_concurrency: None,
+            threads: None,
         }
     }
 
@@ -369,6 +384,7 @@ mod tests {
             Plan { max_concurrency: Some(9), ..plan },
             Plan { accept: f64::NAN, ..plan },
             Plan { conn: usize::MAX, ..plan },
+            Plan { threads: Some(0), ..plan },
         ] {
             assert!(invalid.validate().is_err());
         }
