@@ -38,6 +38,7 @@ pub(crate) struct Summary {
     pub load: LoadStats,
     pub latency: LatencyStats,
     pub setups: Setups,
+    pub tls: Option<crate::Negotiated>,
 }
 
 struct Worker {
@@ -205,6 +206,7 @@ async fn serve(
                     slots[index] = connection;
                 }
                 summary.setups.add(result.setups);
+                summary.tls = summary.tls.or(result.tls);
                 summary.counts.add(result.counts);
                 summary.at_target += usize::from(result.at_target);
                 summary.load.add(result.load);

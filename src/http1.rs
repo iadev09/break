@@ -25,6 +25,18 @@ pub struct Target {
     trust: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
     #[cfg(feature = "tls")]
     resume: bool,
+    #[cfg(feature = "tls")]
+    offer: Offer,
+}
+
+/// What an `https://` target's handshakes offer, where the caller declared
+/// it. A field left `None` keeps the TLS library's default offer.
+#[cfg(feature = "tls")]
+#[derive(Clone, Copy, Debug, Default)]
+struct Offer {
+    version: Option<&'static rustls::SupportedProtocolVersion>,
+    group: Option<&'static dyn rustls::crypto::SupportedKxGroup>,
+    cipher: Option<rustls::SupportedCipherSuite>,
 }
 
 impl Target {
@@ -70,6 +82,8 @@ impl Target {
             trust: None,
             #[cfg(feature = "tls")]
             resume: true,
+            #[cfg(feature = "tls")]
+            offer: Offer::default(),
         })
     }
 
@@ -114,6 +128,65 @@ impl Target {
         self
     }
 
+    /// Offer only this TLS version: `1.2` or `1.3`.
+    #[cfg(feature = "tls")]
+    pub fn tls_version(
+        mut self,
+        version: &str,
+    ) -> Result<Self, BreakReason> {
+        self.offer.version = Some(match version {
+            "1.2" => &rustls::version::TLS12,
+            "1.3" => &rustls::version::TLS13,
+            _ => return Err(BreakReason::Invalid("TLS version is 1.2 or 1.3")),
+        });
+        Ok(self)
+    }
+
+    /// Offer only this key exchange group, by the TLS library's name for it,
+    /// such as `X25519` or `X25519MLKEM768`. The server's handshake cost
+    /// follows from what is negotiated, so the choice is part of the load.
+    #[cfg(feature = "tls")]
+    pub fn tls_group(
+        mut self,
+        name: &str,
+    ) -> Result<Self, BreakReason> {
+        self.offer.group = Some(
+            *rustls::crypto::aws_lc_rs::ALL_KX_GROUPS
+                .iter()
+                .find(|group| {
+                    group
+                        .name()
+                        .as_str()
+                        .is_some_and(|known| known.eq_ignore_ascii_case(name))
+                })
+                .ok_or(BreakReason::Invalid(
+                    "unknown TLS key exchange group",
+                ))?,
+        );
+        Ok(self)
+    }
+
+    /// Offer only this cipher suite, by the TLS library's name for it, such
+    /// as `TLS13_AES_128_GCM_SHA256`.
+    #[cfg(feature = "tls")]
+    pub fn tls_cipher(
+        mut self,
+        name: &str,
+    ) -> Result<Self, BreakReason> {
+        self.offer.cipher = Some(
+            *rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES
+                .iter()
+                .find(|suite| {
+                    suite
+                        .suite()
+                        .as_str()
+                        .is_some_and(|known| known.eq_ignore_ascii_case(name))
+                })
+                .ok_or(BreakReason::Invalid("unknown TLS cipher suite"))?,
+        );
+        Ok(self)
+    }
+
     /// What every connection to an `https://` target presents and verifies.
     #[cfg(feature = "tls")]
     fn tls(
@@ -141,11 +214,24 @@ impl Target {
                 }
             }
         }
-        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|_| BreakReason::Invalid("no usable TLS protocol version"))?
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        if let Some(group) = self.offer.group {
+            provider.kx_groups = vec![group];
+        }
+        if let Some(cipher) = self.offer.cipher {
+            provider.cipher_suites = vec![cipher];
+        }
+        let builder =
+            rustls::ClientConfig::builder_with_provider(Arc::new(provider));
+        let mut config = match self.offer.version {
+            Some(version) => builder.with_protocol_versions(&[version]),
+            None => builder.with_safe_default_protocol_versions(),
+        }
+        .map_err(|_| {
+            BreakReason::Invalid(
+                "the declared TLS version, group and cipher suite do not fit together",
+            )
+        })?
         .with_root_certificates(roots)
         .with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];

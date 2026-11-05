@@ -43,6 +43,8 @@
   records already owed are written before new request bytes are accepted, and
   decrypted bytes still held by the session are reported readable without
   waiting for the socket. The handshake completes inside connection setup.
+  The target may declare the version, key exchange group and cipher suite it
+  offers; what a connection negotiated is reported with each phase.
 - `src/http1/decode.rs`: incremental response framing with httparse. Handles
   interim responses, Content-Length, chunked/trailers, close-delimited bodies and
   coalesced/fragmented replies. Payload bytes are checked in place. Ambiguous or
@@ -118,8 +120,9 @@ parallelism. Protocol-specific scheduling does not change the phase contract.
   responses, invalid framing and dynamically sized header fields.
 - `tests/tls.rs`: a real TLS listener: pipelining inside records at shallow and
   deep depth, the URL's host on the wire with `connect_to`, an untrusted
-  authority failing setup instead of counting as load, and an owner resuming
-  its own session unless resumption is declined.
+  authority failing setup instead of counting as load, an owner resuming its
+  own session unless resumption is declined, and a declared offer being what
+  is negotiated and reported.
 - `tests/connections.rs`: the connection test against a real listener: each
   connection carries its declared requests, asks to close on the last and is
   replaced; a refused setup breaks the connection contract and counts no

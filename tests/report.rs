@@ -19,6 +19,7 @@ fn perfect_status_counts_do_not_pass_when_concurrency_was_not_established() {
         load: LoadStats::default(),
         latency: LatencyStats::default(),
         setups: None,
+        tls: None,
         completed: true,
         cancelled: false,
     };

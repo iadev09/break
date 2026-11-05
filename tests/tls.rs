@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use brk::{CancellationToken, ConnectionPlan, Plan, Target};
+use brk::{BreakReason, CancellationToken, ConnectionPlan, Plan, Target};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 const NAME: &str = "example.test";
@@ -213,4 +213,46 @@ fn a_returning_owner_resumes_its_own_session_unless_told_not_to() {
             assert_eq!(setups.resumed, 0);
         }
     }
+}
+
+#[test]
+fn a_declared_tls_offer_is_what_gets_negotiated_and_reported() {
+    let fixture = Fixture::new();
+    let trusted =
+        || fixture.target().trust_pem(fixture.authority.as_bytes()).unwrap();
+    for (version, group, cipher) in [
+        ("1.3", "X25519MLKEM768", "TLS13_AES_128_GCM_SHA256"),
+        ("1.3", "secp256r1", "TLS13_CHACHA20_POLY1305_SHA256"),
+        ("1.2", "X25519", "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"),
+    ] {
+        let target = trusted()
+            .tls_version(version)
+            .unwrap()
+            .tls_group(group)
+            .unwrap()
+            .tls_cipher(cipher)
+            .unwrap();
+        let done =
+            brk::run(&target, plan(), &CancellationToken::new(), &mut ())
+                .unwrap();
+        let negotiated = done.stats.last_accepted.unwrap().tls.unwrap();
+        assert_eq!(
+            negotiated.version,
+            format!("TLSv{}", version.replace('.', "_"))
+        );
+        assert_eq!(negotiated.cipher, cipher);
+        assert!(negotiated.group.unwrap().eq_ignore_ascii_case(group));
+    }
+    assert!(trusted().tls_version("1.1").is_err());
+    assert!(trusted().tls_group("unknown").is_err());
+    assert!(trusted().tls_cipher("unknown").is_err());
+    // A TLS 1.3 suite cannot be offered with TLS 1.2 alone.
+    let unfit = trusted()
+        .tls_version("1.2")
+        .unwrap()
+        .tls_cipher("TLS13_AES_128_GCM_SHA256")
+        .unwrap();
+    let broken = brk::run(&unfit, plan(), &CancellationToken::new(), &mut ())
+        .unwrap_err();
+    assert!(matches!(broken.reason, BreakReason::Invalid(_)));
 }

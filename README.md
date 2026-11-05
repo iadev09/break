@@ -122,6 +122,16 @@ closing wait state does not pile up on the client's local ports. Running out
 of local ports or descriptors is a client failure and claims nothing about the
 server.
 
+What a handshake costs the server follows from what is negotiated, so that
+is part of the declared load. Each phase prints the version, cipher suite and
+key exchange group one of its connections settled on. Without options the TLS
+library's default offer is used. `--tls-version` (`1.2` or `1.3`),
+`--tls-group` (for example `X25519`, `secp256r1` or the post-quantum hybrid
+`X25519MLKEM768`) and `--tls-cipher` (for example `TLS13_AES_128_GCM_SHA256`)
+each offer only the named choice, in both tests. A combination the server does
+not accept is a setup failure; one that cannot be offered at all is rejected
+before any traffic.
+
 Over TLS each connection owner is one visitor with its own session memory.
 Sessions are resumed by default, as returning clients do; each phase reports
 how many established connections resumed. A server whose session cache does

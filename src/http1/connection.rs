@@ -31,6 +31,7 @@ pub(crate) struct Summary {
     pub load: LoadStats,
     pub latency: LatencyStats,
     pub setups: Setups,
+    pub tls: Option<crate::Negotiated>,
 }
 
 #[derive(Clone, Copy)]
@@ -498,6 +499,9 @@ pub(crate) async fn run_slot(
             meter.stats.connect_nanos += setup.as_nanos();
             match connected {
                 Ok(opened) => {
+                    if summary.tls.is_none() {
+                        summary.tls = opened.stream.negotiated();
+                    }
                     if churn {
                         let setups = &mut summary.setups;
                         setups.attempted += 1;
@@ -567,6 +571,11 @@ pub(crate) async fn run_slot(
                 break;
             }
         }
+    }
+    if let Some(connection) = &connection
+        && summary.tls.is_none()
+    {
+        summary.tls = connection.stream.negotiated();
     }
     summary.load = meter.finish(Instant::now());
     summary.at_target = summary.load.latest_first_target.is_some();

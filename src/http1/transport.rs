@@ -51,6 +51,15 @@ impl Transport {
         Ok(Self::Plain(stream))
     }
 
+    /// What this connection's TLS handshake settled on.
+    pub(crate) fn negotiated(&self) -> Option<crate::Negotiated> {
+        match self {
+            Self::Plain(_) => None,
+            #[cfg(feature = "tls")]
+            Self::Tls(secure) => secure.negotiated(),
+        }
+    }
+
     /// Whether this connection's TLS handshake resumed an earlier session.
     pub(crate) fn resumed(&self) -> bool {
         match self {
@@ -197,6 +206,21 @@ pub(crate) mod secure {
             }
             secure.flush()?;
             Ok(secure)
+        }
+
+        pub(super) fn negotiated(&self) -> Option<crate::Negotiated> {
+            Some(crate::Negotiated {
+                version: self.session.protocol_version()?.as_str()?,
+                cipher: self
+                    .session
+                    .negotiated_cipher_suite()?
+                    .suite()
+                    .as_str()?,
+                group: self
+                    .session
+                    .negotiated_key_exchange_group()
+                    .and_then(|group| group.name().as_str()),
+            })
         }
 
         pub(super) fn resumed(&self) -> bool {

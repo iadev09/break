@@ -275,10 +275,12 @@ fn phases(
         let mut load = LoadStats::default();
         let mut latency = LatencyStats::default();
         let mut setups = Setups::default();
+        let mut tls = None;
         for reply in replies {
             match receive(reply) {
                 Ok(summary) => {
                     setups.add(summary.setups);
+                    tls = tls.or(summary.tls);
                     counts.add(summary.counts);
                     at_target += summary.at_target;
                     load.add(summary.load);
@@ -301,6 +303,7 @@ fn phases(
             load,
             latency,
             setups: lifetime.map(|_| setups),
+            tls,
             completed: failure.is_none() && !stop.is_cancelled(),
             cancelled: stop.is_cancelled(),
         };

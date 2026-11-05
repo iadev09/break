@@ -51,6 +51,20 @@ struct Common {
     #[cfg(feature = "tls")]
     #[arg(long)]
     no_resume: bool,
+    /// For https://, offer only this TLS version: 1.2 or 1.3.
+    #[cfg(feature = "tls")]
+    #[arg(long, value_name = "VERSION")]
+    tls_version: Option<String>,
+    /// For https://, offer only this key exchange group, for example X25519
+    /// or X25519MLKEM768.
+    #[cfg(feature = "tls")]
+    #[arg(long, value_name = "NAME")]
+    tls_group: Option<String>,
+    /// For https://, offer only this cipher suite, for example
+    /// TLS13_AES_128_GCM_SHA256.
+    #[cfg(feature = "tls")]
+    #[arg(long, value_name = "NAME")]
+    tls_cipher: Option<String>,
     /// Time at each level, for example 10s.
     #[arg(long, value_parser = humantime::parse_duration)]
     phase: Duration,
@@ -257,6 +271,15 @@ fn target(common: &Common) -> Result<Target, BreakReason> {
         if common.no_resume {
             target = target.without_resumption();
         }
+        if let Some(version) = &common.tls_version {
+            target = target.tls_version(version)?;
+        }
+        if let Some(group) = &common.tls_group {
+            target = target.tls_group(group)?;
+        }
+        if let Some(cipher) = &common.tls_cipher {
+            target = target.tls_cipher(cipher)?;
+        }
     }
     if let Some(body) = &common.expect_body {
         target = target.expect_body(body.clone().into_bytes());
@@ -373,6 +396,14 @@ impl Observer for Printer {
             println!("  {marker} ({} {unit})", stats.phase.total_concurrency);
         } else {
             eprintln!("  {marker} ({} {unit})", stats.phase.total_concurrency);
+        }
+        if let Some(tls) = &stats.tls {
+            println!(
+                "  tls: version={} cipher={} group={}",
+                tls.version,
+                tls.cipher,
+                tls.group.unwrap_or("none")
+            );
         }
         if let Some(setups) = &stats.setups {
             let setup_mean = setups

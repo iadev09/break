@@ -41,6 +41,15 @@ impl Counts {
     }
 }
 
+/// What a TLS handshake settled on, in the TLS library's own names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Negotiated {
+    pub version: &'static str,
+    pub cipher: &'static str,
+    /// Absent where the handshake exchanged no key, as a resumed TLS 1.2 one.
+    pub group: Option<&'static str>,
+}
+
 /// Connection setups of one phase in the connection test, counted apart from
 /// requests. A setup is the connect call through the end of the handshake.
 #[derive(Clone, Copy, Debug, Default)]
@@ -105,6 +114,8 @@ pub struct PhaseStats {
     /// The connection test's own outcomes; `None` in the request test, where
     /// connections are opened once and a failed setup is not a measurement.
     pub setups: Option<Setups>,
+    /// What one of the phase's TLS connections negotiated; `None` over TCP.
+    pub tls: Option<Negotiated>,
     /// False when execution was interrupted by a setup/execution/protocol failure.
     pub completed: bool,
     pub cancelled: bool,
