@@ -241,8 +241,72 @@ The runner does not repeat, refine or claim a confidence interval. An explicit
 
 ## Library
 
-`run(&target, plan, &cancellation, &mut observer)` returns `Result<Done, Broken>`.
-It owns its CPU workers and joins them before returning. Disable the CLI with
+`brk` has no scripting language and is not going to get one. Where another
+tool takes a script, `brk` is a library: a bench that needs more than the
+command line is a small Rust program of your own, your own `brk`.
+
+That program decides everything around the load:
+
+- which targets and plans run, and in what order;
+- what is read at each phase boundary: the server's CPU and memory, a metrics
+  endpoint, anything the machine can tell you;
+- what is written, in which format, and what the process exits with;
+- where it runs: on its own, or inside a test suite.
+
+It decides nothing on the request path, and that is the point. A callback per
+request would be the client's own cost and would change what is measured.
+Yours run between phases, on the calling thread, and the compiler checks them
+before a single request is sent. The request itself is a fixed GET with an
+optional exact status and body.
+
+```rust,no_run
+use std::time::Duration;
+use brk::{Broken, CancellationToken, Observer, PhaseStats, Plan, Target};
+
+/// One line a phase: what a script would print, typed.
+struct Lines(&'static str);
+
+impl Observer for Lines {
+    fn phase_finished(&mut self, stats: &PhaseStats) {
+        println!(
+            "{},{},{:.0},{}",
+            self.0,
+            stats.phase.total_concurrency,
+            stats.requests_per_sec(),
+            stats.counts.failed()
+        );
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let plan = Plan {
+        conn: 256, start: 1, pace: 1,
+        phase_duration: Duration::from_secs(30),
+        timeout: Duration::from_millis(100),
+        accept: 99.99, max_concurrency: Some(16), threads: Some(4),
+    };
+    // The same plan against two builds of a server, one after the other.
+    for (name, url) in [
+        ("before", "http://127.0.0.1:8080/plain"),
+        ("after", "http://127.0.0.1:8081/plain"),
+    ] {
+        let target = Target::new(url)?.expect_body("Hello, World!");
+        let stop = CancellationToken::new();
+        match brk::run(&target, plan, &stop, &mut Lines(name)) {
+            Ok(done) => println!("{name}: ceiling reached, {} phases", done.stats.phases),
+            Err(Broken { reason, stats }) => {
+                let held = stats.last_accepted.map(|phase| phase.phase.total_concurrency);
+                println!("{name}: {reason}; last accepted {held:?}");
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+`run(&target, plan, &cancellation, &mut observer)` returns `Result<Done, Broken>`;
+`run_connections` does the same for the connection test.
+Each owns its CPU workers and joins them before returning. Disable the CLI with
 `default-features = false` when embedding the library.
 
 ```rust,no_run
