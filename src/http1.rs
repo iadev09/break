@@ -16,7 +16,7 @@ pub(crate) use engine::serve;
 #[cfg(feature = "http2")]
 pub(crate) use transport::{Sessions, Transport};
 
-/// One GET target and optional exact response validation.
+/// One GET target, or a POST with a body, and optional exact response validation.
 ///
 /// An `http://` URL is requested over TCP, an `https://` URL over TLS on the
 /// same connection model. Nothing else about a run depends on the scheme.
@@ -25,6 +25,10 @@ pub struct Target {
     uri: Uri,
     status: Option<StatusCode>,
     body: Option<Bytes>,
+    /// Sent with every request, which is then a POST.
+    send: Option<Bytes>,
+    /// The response body must be exactly `send`.
+    echo: bool,
     connect: Option<SocketAddr>,
     #[cfg(feature = "tls")]
     trust: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
@@ -86,6 +90,8 @@ impl Target {
             uri,
             status: None,
             body: None,
+            send: None,
+            echo: false,
             connect: None,
             #[cfg(feature = "tls")]
             trust: None,
@@ -323,6 +329,24 @@ impl Target {
         self
     }
 
+    /// Send this body with every request, which is then a POST with its
+    /// `content-length` and `content-type: application/octet-stream`. It is
+    /// encoded once and shared by every request.
+    pub fn post_body(
+        mut self,
+        body: impl Into<Bytes>,
+    ) -> Self {
+        self.send = Some(body.into());
+        self
+    }
+
+    /// Require each response body to be as long as the body that was sent:
+    /// an echo. Its bytes are counted, not compared.
+    pub fn expect_echo(mut self) -> Self {
+        self.echo = true;
+        self
+    }
+
     pub(crate) fn resolve(&self) -> Result<Prepared, BreakReason> {
         let host =
             self.uri.host().ok_or(BreakReason::Invalid("missing host"))?;
@@ -343,28 +367,55 @@ impl Target {
         let tls = secure.then(|| self.tls(host)).transpose()?;
         let path = self.uri.path_and_query().map_or("/", |path| path.as_str());
         let host_line = self.uri.authority().unwrap();
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: {host_line}\r\n\r\n");
-        // The last request of a connection that the client means to end.
-        let closing = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host_line}\r\nConnection: close\r\n\r\n"
-        );
+        // An echo's reply is as long as what was sent; its bytes are counted,
+        // not compared.
+        let length = match (self.echo, &self.send) {
+            (true, None) => {
+                return Err(BreakReason::Invalid(
+                    "an echo needs a body to send",
+                ));
+            }
+            (true, Some(sent)) => Some(sent.len()),
+            (false, _) => None,
+        };
+        let (request, closing) = match &self.send {
+            None => (
+                format!("GET {path} HTTP/1.1\r\nHost: {host_line}\r\n\r\n")
+                    .into_bytes(),
+                // The last request of a connection that the client means to end.
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: {host_line}\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes(),
+            ),
+            Some(body) => {
+                let head = |closing: &str| {
+                    let mut request = format!(
+                        "POST {path} HTTP/1.1\r\nHost: {host_line}\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\n{closing}\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    request.extend_from_slice(body);
+                    request
+                };
+                (head(""), head("Connection: close\r\n"))
+            }
+        };
         Ok(Prepared {
             addresses,
-            requests: request
-                .as_bytes()
-                .repeat((CHUNK / request.len()).max(1))
-                .into(),
-            request: request.into_bytes(),
-            closing: closing.into_bytes(),
+            requests: request.repeat((CHUNK / request.len()).max(1)).into(),
+            request,
+            closing,
             status: self.status,
             body: self.body.clone(),
+            length,
             #[cfg(feature = "tls")]
             tls,
             #[cfg(feature = "http2")]
-            http2: self
-                .http2
-                .then(|| crate::http2::Head { uri: self.uri.clone() }),
+            http2: self.http2.then(|| crate::http2::Head {
+                uri: self.uri.clone(),
+                send: self.send.clone(),
+            }),
         })
     }
 }
@@ -382,6 +433,7 @@ pub(crate) struct Prepared {
     closing: Vec<u8>,
     status: Option<StatusCode>,
     body: Option<Bytes>,
+    length: Option<usize>,
     #[cfg(feature = "tls")]
     tls: Option<transport::secure::Tls>,
     #[cfg(feature = "http2")]
@@ -397,6 +449,7 @@ impl Prepared {
             closing: self.closing.clone().into_boxed_slice(),
             status: self.status,
             body: self.body.clone(),
+            length: self.length,
             #[cfg(feature = "tls")]
             tls: self.tls.clone(),
             #[cfg(feature = "http2")]
@@ -412,6 +465,7 @@ pub(crate) struct Client {
     closing: Box<[u8]>,
     pub(crate) status: Option<StatusCode>,
     pub(crate) body: Option<Bytes>,
+    pub(crate) length: Option<usize>,
     #[cfg(feature = "tls")]
     tls: Option<transport::secure::Tls>,
     #[cfg(feature = "http2")]

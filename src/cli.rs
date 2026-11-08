@@ -98,6 +98,13 @@ struct Common {
     /// Additionally require this exact response body, without text decoding.
     #[arg(long)]
     expect_body: Option<String>,
+    /// POST this file's contents with every request (`-` reads standard
+    /// input): read once at start, sent with its content-length.
+    #[arg(long, value_name = "FILE")]
+    body_file: Option<std::path::PathBuf>,
+    /// Require each response body to be as long as the body sent: an echo.
+    #[arg(long, requires = "body_file")]
+    expect_echo: bool,
 }
 
 #[derive(Args)]
@@ -306,6 +313,19 @@ fn target(common: &Common) -> Result<Target, BreakReason> {
     #[cfg(feature = "http2")]
     if common.http2 {
         target = target.http2();
+    }
+    if let Some(path) = &common.body_file {
+        let body = if path.as_os_str() == "-" {
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut body)?;
+            body
+        } else {
+            std::fs::read(path)?
+        };
+        target = target.post_body(body);
+    }
+    if common.expect_echo {
+        target = target.expect_echo();
     }
     if let Some(body) = &common.expect_body {
         target = target.expect_body(body.clone().into_bytes());

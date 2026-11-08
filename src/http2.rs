@@ -21,6 +21,33 @@ use crate::{BreakReason, Negotiated};
 #[derive(Clone)]
 pub(crate) struct Head {
     pub(crate) uri: http::Uri,
+    /// Sent with every request, which is then a POST: one shared buffer,
+    /// sent as slices of itself.
+    pub(crate) send: Option<Bytes>,
+}
+
+/// Send a request body as the peer's flow control allows, in slices of the
+/// one shared buffer.
+async fn send_body(
+    mut stream: h2::SendStream<Bytes>,
+    mut rest: Bytes,
+) -> Result<(), h2::Error> {
+    if rest.is_empty() {
+        return stream.send_data(rest, true);
+    }
+    while !rest.is_empty() {
+        stream.reserve_capacity(rest.len());
+        let capacity = match poll_fn(|cx| stream.poll_capacity(cx)).await {
+            Some(capacity) => capacity?,
+            None => return Err(h2::Error::from(h2::Reason::CANCEL)),
+        };
+        if capacity == 0 {
+            continue;
+        }
+        let chunk = rest.split_to(capacity.min(rest.len()));
+        stream.send_data(chunk, rest.is_empty())?;
+    }
+    Ok(())
 }
 
 pub(crate) struct Connection {
@@ -55,12 +82,22 @@ fn io_error(error: h2::Error) -> io::Error {
 /// connection and its other streams stay.
 async fn stream(
     response: h2::client::ResponseFuture,
+    sending: Option<(h2::SendStream<Bytes>, Bytes)>,
     status: Option<StatusCode>,
     body: Option<Bytes>,
+    length: Option<usize>,
     began: Instant,
     deadline: Instant,
 ) -> Finished {
-    let answered = tokio::time::timeout_at(deadline.into(), async {
+    // A body goes out while the response comes in: an echo can answer
+    // before the request has ended.
+    let send = async move {
+        match sending {
+            Some((stream, body)) => send_body(stream, body).await,
+            None => Ok(()),
+        }
+    };
+    let receive = async {
         let response = response.await?;
         let received = response.status();
         let status_ok = received.is_success()
@@ -80,7 +117,8 @@ async fn stream(
             offset += chunk.len();
         }
         let body_ok = matches
-            && body.as_ref().is_none_or(|expected| expected.len() == offset);
+            && body.as_ref().is_none_or(|expected| expected.len() == offset)
+            && length.is_none_or(|length| length == offset);
         Ok::<_, h2::Error>(if !status_ok {
             Outcome::Status
         } else if !body_ok {
@@ -88,6 +126,11 @@ async fn stream(
         } else {
             Outcome::Accepted
         })
+    };
+    let answered = tokio::time::timeout_at(deadline.into(), async {
+        let (sent, received) = tokio::join!(send, receive);
+        sent?;
+        received
     })
     .await;
     let (outcome, complete) = match answered {
@@ -206,21 +249,33 @@ impl Carrier for Connection {
                 ready = poll_fn(|cx| send.poll_ready(cx)), if opens => {
                     let now = Instant::now();
                     let opened = ready.and_then(|()| {
-                        let request = Request::get(head.uri.clone())
-                            .body(())
-                            .expect("a validated target URI");
-                        send.send_request(request, true)
+                        let request = match &head.send {
+                            None => Request::get(head.uri.clone()),
+                            Some(body) => Request::post(head.uri.clone())
+                                .header(
+                                    http::header::CONTENT_TYPE,
+                                    "application/octet-stream",
+                                )
+                                .header(http::header::CONTENT_LENGTH, body.len()),
+                        }
+                        .body(())
+                        .expect("a validated target URI");
+                        send.send_request(request, head.send.is_none())
                     });
                     match opened {
-                        Ok((response, _)) => {
+                        Ok((response, request_body)) => {
                             if let Some(remaining) = remaining.as_mut() {
                                 *remaining -= 1;
                             }
                             summary.counts.sent += 1;
                             streams.push(stream(
                                 response,
+                                head.send
+                                    .clone()
+                                    .map(|body| (request_body, body)),
                                 client.status,
                                 client.body.clone(),
+                                client.length,
                                 now,
                                 now + window.timeout,
                             ));
