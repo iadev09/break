@@ -85,7 +85,6 @@ async fn stream(
     sending: Option<(h2::SendStream<Bytes>, Bytes)>,
     status: Option<StatusCode>,
     body: Option<Bytes>,
-    length: Option<usize>,
     began: Instant,
     deadline: Instant,
 ) -> Finished {
@@ -117,8 +116,7 @@ async fn stream(
             offset += chunk.len();
         }
         let body_ok = matches
-            && body.as_ref().is_none_or(|expected| expected.len() == offset)
-            && length.is_none_or(|length| length == offset);
+            && body.as_ref().is_none_or(|expected| expected.len() == offset);
         Ok::<_, h2::Error>(if !status_ok {
             Outcome::Status
         } else if !body_ok {
@@ -275,7 +273,6 @@ impl Carrier for Connection {
                                     .map(|body| (request_body, body)),
                                 client.status,
                                 client.body.clone(),
-                                client.length,
                                 now,
                                 now + window.timeout,
                             ));

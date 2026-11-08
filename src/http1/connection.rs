@@ -201,11 +201,7 @@ impl Conn {
         buffer.resize(super::CHUNK, 0);
         Ok(Self {
             stream,
-            decoder: Decoder::new(
-                client.status,
-                client.body.clone(),
-                client.length,
-            ),
+            decoder: Decoder::new(client.status, client.body.clone()),
             pending: VecDeque::new(),
             buffer,
             writing: None,

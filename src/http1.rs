@@ -340,8 +340,8 @@ impl Target {
         self
     }
 
-    /// Require each response body to be as long as the body that was sent:
-    /// an echo. Its bytes are counted, not compared.
+    /// Require each response body to be exactly the body that was sent: an
+    /// echo. Headers may differ; the bytes are compared with the sent buffer.
     pub fn expect_echo(mut self) -> Self {
         self.echo = true;
         self
@@ -367,16 +367,21 @@ impl Target {
         let tls = secure.then(|| self.tls(host)).transpose()?;
         let path = self.uri.path_and_query().map_or("/", |path| path.as_str());
         let host_line = self.uri.authority().unwrap();
-        // An echo's reply is as long as what was sent; its bytes are counted,
-        // not compared.
-        let length = match (self.echo, &self.send) {
-            (true, None) => {
+        // An echo's reply body is exactly what was sent: the one shared buffer,
+        // compared a received chunk at a time. Its headers may differ.
+        let expected = match (self.echo, &self.send, &self.body) {
+            (true, None, _) => {
                 return Err(BreakReason::Invalid(
                     "an echo needs a body to send",
                 ));
             }
-            (true, Some(sent)) => Some(sent.len()),
-            (false, _) => None,
+            (true, Some(_), Some(_)) => {
+                return Err(BreakReason::Invalid(
+                    "an echo already names the expected body",
+                ));
+            }
+            (true, Some(sent), None) => Some(sent.clone()),
+            (false, _, body) => body.clone(),
         };
         let (request, closing) = match &self.send {
             None => (
@@ -407,8 +412,7 @@ impl Target {
             request,
             closing,
             status: self.status,
-            body: self.body.clone(),
-            length,
+            body: expected,
             #[cfg(feature = "tls")]
             tls,
             #[cfg(feature = "http2")]
@@ -433,7 +437,6 @@ pub(crate) struct Prepared {
     closing: Vec<u8>,
     status: Option<StatusCode>,
     body: Option<Bytes>,
-    length: Option<usize>,
     #[cfg(feature = "tls")]
     tls: Option<transport::secure::Tls>,
     #[cfg(feature = "http2")]
@@ -449,7 +452,6 @@ impl Prepared {
             closing: self.closing.clone().into_boxed_slice(),
             status: self.status,
             body: self.body.clone(),
-            length: self.length,
             #[cfg(feature = "tls")]
             tls: self.tls.clone(),
             #[cfg(feature = "http2")]
@@ -465,7 +467,6 @@ pub(crate) struct Client {
     closing: Box<[u8]>,
     pub(crate) status: Option<StatusCode>,
     pub(crate) body: Option<Bytes>,
-    pub(crate) length: Option<usize>,
     #[cfg(feature = "tls")]
     tls: Option<transport::secure::Tls>,
     #[cfg(feature = "http2")]

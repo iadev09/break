@@ -27,9 +27,6 @@ pub(super) struct Decoder {
     line: Vec<u8>,
     expected_status: Option<StatusCode>,
     expected_body: Option<Bytes>,
-    /// Without an expected body, the length the body must have; its bytes are
-    /// only counted.
-    expected_length: Option<usize>,
     offset: usize,
     matches: bool,
     status: u16,
@@ -40,14 +37,12 @@ impl Decoder {
     pub fn new(
         status: Option<StatusCode>,
         body: Option<Bytes>,
-        length: Option<usize>,
     ) -> Self {
         Self {
             state: State::Head,
             line: Vec::new(),
             expected_status: status,
             expected_body: body,
-            expected_length: length,
             offset: 0,
             matches: true,
             status: 0,
@@ -195,8 +190,6 @@ impl Decoder {
                 .ok_or(BreakReason::Protocol("body offset overflow"))?;
             self.matches &= expected.get(self.offset..end) == Some(data);
             self.offset = end;
-        } else if self.expected_length.is_some() {
-            self.offset = self.offset.saturating_add(data.len());
         }
         Ok(())
     }
@@ -212,8 +205,7 @@ impl Decoder {
             && self
                 .expected_body
                 .as_ref()
-                .is_none_or(|expected| expected.len() == self.offset)
-            && self.expected_length.is_none_or(|length| length == self.offset);
+                .is_none_or(|expected| expected.len() == self.offset);
         let outcome = if !status_ok {
             Outcome::Status
         } else if !body_ok {
@@ -385,7 +377,7 @@ mod tests {
         let bytes = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n1\r\no\r\n1\r\nk\r\n0\r\nX-Test: yes\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
         for size in 1..=bytes.len() {
             let mut decoder =
-                Decoder::new(None, Some(Bytes::from_static(b"ok")), None);
+                Decoder::new(None, Some(Bytes::from_static(b"ok")));
             let mut replies = Vec::new();
             for packet in bytes.chunks(size) {
                 consume(&mut decoder, packet, &mut replies).unwrap();
@@ -406,7 +398,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nok",
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nno-colon\r\n\r\n",
         ] {
-            let mut decoder = Decoder::new(None, None, None);
+            let mut decoder = Decoder::new(None, None);
             assert!(consume(&mut decoder, bytes, &mut Vec::new()).is_err());
         }
     }
@@ -419,8 +411,7 @@ mod tests {
         }
         bytes.extend_from_slice(b"\r\nok");
         let mut replies = Vec::new();
-        consume(&mut Decoder::new(None, None, None), &bytes, &mut replies)
-            .unwrap();
+        consume(&mut Decoder::new(None, None), &bytes, &mut replies).unwrap();
         assert_eq!(replies.len(), 1);
         assert!(matches!(replies[0].outcome, Outcome::Accepted));
     }

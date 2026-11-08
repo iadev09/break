@@ -102,7 +102,8 @@ struct Common {
     /// input): read once at start, sent with its content-length.
     #[arg(long, value_name = "FILE")]
     body_file: Option<std::path::PathBuf>,
-    /// Require each response body to be as long as the body sent: an echo.
+    /// Require each response body to be exactly the body sent: an echo.
+    /// Headers may differ.
     #[arg(long, requires = "body_file")]
     expect_echo: bool,
 }
