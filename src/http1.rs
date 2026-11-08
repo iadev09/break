@@ -29,6 +29,8 @@ pub struct Target {
     #[cfg(feature = "tls")]
     trust: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
     #[cfg(feature = "tls")]
+    verify: bool,
+    #[cfg(feature = "tls")]
     resume: bool,
     #[cfg(feature = "tls")]
     offer: Offer,
@@ -88,6 +90,8 @@ impl Target {
             #[cfg(feature = "tls")]
             trust: None,
             #[cfg(feature = "tls")]
+            verify: true,
+            #[cfg(feature = "tls")]
             resume: true,
             #[cfg(feature = "tls")]
             offer: Offer::default(),
@@ -127,6 +131,15 @@ impl Target {
         }
         self.trust = Some(authorities);
         Ok(self)
+    }
+
+    /// Accept any server certificate, for a host with a self-signed or
+    /// private one. The handshake still runs and the connection is still
+    /// encrypted; only the server's identity goes unchecked.
+    #[cfg(feature = "tls")]
+    pub fn without_verification(mut self) -> Self {
+        self.verify = false;
+        self
     }
 
     /// Make every TLS handshake a full one. Sessions are resumed otherwise,
@@ -221,6 +234,7 @@ impl Target {
     ) -> Result<transport::secure::Tls, BreakReason> {
         let mut roots = rustls::RootCertStore::empty();
         match &self.trust {
+            _ if !self.verify => {}
             Some(authorities) => {
                 for authority in authorities {
                     roots.add(authority.clone()).map_err(|_| {
@@ -254,9 +268,10 @@ impl Target {
         if let Some(cipher) = self.offer.cipher {
             provider.cipher_suites = vec![cipher];
         }
+        let signatures = provider.signature_verification_algorithms;
         let builder =
             rustls::ClientConfig::builder_with_provider(Arc::new(provider));
-        let mut config = match self.offer.version {
+        let builder = match self.offer.version {
             Some(version) => builder.with_protocol_versions(&[version]),
             None => builder.with_safe_default_protocol_versions(),
         }
@@ -264,8 +279,14 @@ impl Target {
             BreakReason::Invalid(
                 "the declared TLS version, group and cipher suite do not fit together",
             )
-        })?
-        .with_root_certificates(roots)
+        })?;
+        let mut config = if self.verify {
+            builder.with_root_certificates(roots)
+        } else {
+            builder.dangerous().with_custom_certificate_verifier(Arc::new(
+                AnyCertificate(signatures),
+            ))
+        }
         .with_no_client_auth();
         config.alpn_protocols = vec![if self.speaks_http2() {
             b"h2".to_vec()
@@ -484,5 +505,50 @@ mod tests {
         assert!(!is_local_resource(&std::io::Error::from_raw_os_error(
             libc::ECONNREFUSED
         )));
+    }
+}
+
+/// A server certificate is accepted whoever it names; its handshake
+/// signatures are still checked, so the connection is still encrypted to the
+/// key that certificate holds.
+#[cfg(feature = "tls")]
+#[derive(Debug)]
+struct AnyCertificate(rustls::crypto::WebPkiSupportedAlgorithms);
+
+#[cfg(feature = "tls")]
+impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+    {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+    {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_schemes()
     }
 }

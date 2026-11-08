@@ -47,6 +47,11 @@ struct Common {
     #[cfg(feature = "tls")]
     #[arg(long, value_name = "FILE")]
     cacert: Option<std::path::PathBuf>,
+    /// For https://, accept any server certificate instead of verifying it:
+    /// a self-signed or private host. The connection is still encrypted.
+    #[cfg(feature = "tls")]
+    #[arg(long, conflicts_with = "cacert")]
+    insecure: bool,
     /// For https://, make every handshake a full one instead of resuming.
     #[cfg(feature = "tls")]
     #[arg(long)]
@@ -277,6 +282,9 @@ fn target(common: &Common) -> Result<Target, BreakReason> {
     {
         if let Some(path) = &common.cacert {
             target = target.trust_pem(&std::fs::read(path)?)?;
+        }
+        if common.insecure {
+            target = target.without_verification();
         }
         if common.no_resume {
             target = target.without_resumption();
