@@ -23,6 +23,9 @@ pub(crate) struct Command {
     pub timeout: std::time::Duration,
     pub start: watch::Receiver<Option<Instant>>,
     pub phase_stop: CancellationToken,
+    /// Where the phase's connections report reaching their depth, and this
+    /// worker its end.
+    pub loaded: std::sync::Arc<crate::load::Loaded>,
     pub ready: Sender<()>,
     pub reply: Sender<Summary>,
 }
@@ -230,11 +233,15 @@ async fn serve(
                 let client = &client;
                 let stop = &stop;
                 let phase_stop = &command.phase_stop;
+                let loaded = &command.loaded;
                 pending.push(async move {
                     (
                         index,
-                        run_owner(client, connection, window, stop, phase_stop)
-                            .await,
+                        run_owner(
+                            client, connection, window, stop, phase_stop,
+                            loaded,
+                        )
+                        .await,
                     )
                 });
             }
@@ -253,6 +260,10 @@ async fn serve(
                     summary.failure.get_or_insert(failure);
                 }
             }
+        }
+        // A worker with no connection this phase has nothing to end.
+        if summary.counts.attempted > 0 || summary.failure.is_some() {
+            command.loaded.finished();
         }
         let _ = command.reply.send(summary);
     }

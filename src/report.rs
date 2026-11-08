@@ -119,6 +119,10 @@ pub struct PhaseStats {
     /// False when execution was interrupted by a setup/execution/protocol failure.
     pub completed: bool,
     pub cancelled: bool,
+    /// The machine while the phase was loaded: from the last connection first
+    /// carrying its full depth to the end of admission, before drain. `None`
+    /// when the phase never got there or the platform has no reading.
+    pub machine: Option<crate::MachineCpu>,
 }
 
 impl PhaseStats {
@@ -236,6 +240,22 @@ pub trait Observer {
 
     /// Workers are ready but no request from this phase has been sent.
     fn phase_started(
+        &mut self,
+        _phase: &Phase,
+    ) {
+    }
+
+    /// Every connection carries its full depth: the phase is loaded. Not
+    /// called for a phase that never gets there.
+    fn phase_loaded(
+        &mut self,
+        _phase: &Phase,
+    ) {
+    }
+
+    /// The phase stopped admitting requests, at its end or earlier on a
+    /// failure; what was admitted is still draining.
+    fn phase_load_ended(
         &mut self,
         _phase: &Phase,
     ) {

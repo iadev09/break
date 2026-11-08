@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod acceptance;
+mod cpu;
 mod http1;
 #[cfg(feature = "http2")]
 mod http2;
@@ -14,6 +15,7 @@ mod worker;
 pub mod cli;
 
 pub use acceptance::Acceptance;
+pub use cpu::{MachineCpu, MachineSample};
 pub use http1::Target;
 pub use latency::LatencyStats;
 pub use load::LoadStats;

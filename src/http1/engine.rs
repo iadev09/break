@@ -116,6 +116,7 @@ enum Opened {
 struct Phase<'a> {
     client: &'a Client,
     window: Window,
+    loaded: &'a std::sync::Arc<crate::load::Loaded>,
     churn: bool,
     /// The run was cancelled.
     cancelled: bool,
@@ -138,6 +139,7 @@ impl Owner {
             window.start,
             window.duration,
             window.per_connection,
+            Some(phase.loaded.clone()),
         ));
         self.sessions =
             if phase.churn { own_sessions(phase.client) } else { None };
@@ -647,6 +649,7 @@ impl Engine {
         let mut phase = Phase {
             client,
             window,
+            loaded: &command.loaded,
             churn: command.churn.is_some(),
             cancelled: stop.is_cancelled(),
             halted: stop.is_cancelled() || command.phase_stop.is_cancelled(),
@@ -824,6 +827,10 @@ pub(crate) fn serve(
             Some(start) => engine.phase(&client, &command, start, &stop),
             None => crate::worker::Summary::default(),
         };
+        // A worker with no connection this phase has nothing to end.
+        if summary.counts.attempted > 0 || summary.failure.is_some() {
+            command.loaded.finished();
+        }
         let _ = command.reply.send(summary);
     }
 }

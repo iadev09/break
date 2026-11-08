@@ -91,6 +91,10 @@ struct Common {
     /// Minimum successful percentage within the deadline.
     #[arg(long, alias = "sla", default_value_t = 99.99)]
     accept: f64,
+    /// Before the first phase, read the machine for one phase with no
+    /// traffic: what everything else on it uses, and so what the test had.
+    #[arg(long)]
+    baseline: bool,
     /// Additionally require this exact response body, without text decoding.
     #[arg(long)]
     expect_body: Option<String>,
@@ -309,6 +313,48 @@ fn target(common: &Common) -> Result<Target, BreakReason> {
     Ok(target)
 }
 
+/// The machine with no traffic for one phase's length, before the ramp.
+fn baseline(phase: Duration) {
+    let Some(before) = crate::MachineSample::read() else {
+        println!("Baseline: no machine CPU reading on this platform");
+        return;
+    };
+    std::thread::sleep(phase);
+    match crate::MachineSample::read().and_then(|after| before.until(after)) {
+        Some(machine) => {
+            println!("Baseline: {} with no traffic", Machine(&machine))
+        }
+        None => println!("Baseline: the machine CPU counters gave no reading"),
+    }
+}
+
+/// One machine window, as the phases print it.
+struct Machine<'a>(&'a crate::MachineCpu);
+
+impl std::fmt::Display for Machine<'_> {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        let machine = self.0;
+        write!(
+            f,
+            "machine busy {:.2} of {} CPUs ({:.1}%), unused {:.2}: user {:.1}% system {:.1}% softirq {:.1}% irq {:.1}% iowait {:.1}% steal {:.1}% over {:.1}s",
+            machine.busy_cpus,
+            machine.cpus,
+            machine.busy_percent,
+            f64::from(machine.cpus) - machine.busy_cpus,
+            machine.user_percent,
+            machine.system_percent,
+            machine.softirq_percent,
+            machine.irq_percent,
+            machine.iowait_percent,
+            machine.steal_percent,
+            machine.seconds
+        )
+    }
+}
+
 fn execute(test: Test) -> Result<crate::Done, Broken> {
     let setup_error = |reason| Broken { reason, stats: Box::default() };
     let stop = CancellationToken::new();
@@ -332,6 +378,9 @@ fn execute(test: Test) -> Result<crate::Done, Broken> {
                 threads: args.common.threads,
             };
             let acceptance = plan.validate().map_err(setup_error)?;
+            if args.common.baseline {
+                baseline(args.common.phase);
+            }
             interrupt()?;
             crate::run(
                 &target,
@@ -353,6 +402,9 @@ fn execute(test: Test) -> Result<crate::Done, Broken> {
                 threads: args.common.threads,
             };
             let acceptance = plan.validate().map_err(setup_error)?;
+            if args.common.baseline {
+                baseline(args.common.phase);
+            }
             interrupt()?;
             crate::run_connections(
                 &target,
@@ -427,6 +479,12 @@ impl Observer for Printer {
             println!("  {marker} ({} {unit})", stats.phase.total_concurrency);
         } else {
             eprintln!("  {marker} ({} {unit})", stats.phase.total_concurrency);
+        }
+        match &stats.machine {
+            Some(machine) => println!("  loaded: {}", Machine(machine)),
+            None => println!(
+                "  loaded: no machine reading (not fully loaded, or no reading on this platform)"
+            ),
         }
         if let Some(tls) = &stats.tls {
             println!(

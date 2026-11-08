@@ -681,10 +681,15 @@ pub(crate) async fn run_owner<C: Carrier>(
     window: Window,
     stop: &CancellationToken,
     phase_stop: &CancellationToken,
+    loaded: &std::sync::Arc<crate::load::Loaded>,
 ) -> (Option<C>, Summary) {
     let mut summary = Summary::default();
-    let mut meter =
-        Meter::new(window.start, window.duration, window.per_connection);
+    let mut meter = Meter::new(
+        window.start,
+        window.duration,
+        window.per_connection,
+        Some(loaded.clone()),
+    );
     // In the connection test an owner is one visitor: it remembers its own
     // TLS sessions and nobody else's.
     let churn = window.lifetime.is_some();

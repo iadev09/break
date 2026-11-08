@@ -249,6 +249,9 @@ fn phases(
             .ok_or(BreakReason::Overflow)?;
         let (start, waiting) = watch::channel(None);
         let phase_stop = CancellationToken::new();
+        let (events, heard) = mpsc::channel();
+        let loaded =
+            std::sync::Arc::new(crate::load::Loaded::new(connections, events));
         let mut readiness = Vec::new();
         let mut replies = Vec::new();
         readiness
@@ -272,6 +275,7 @@ fn phases(
                     timeout: plan.timeout,
                     start: waiting.clone(),
                     phase_stop: phase_stop.clone(),
+                    loaded: loaded.clone(),
                     ready,
                     reply,
                 },
@@ -282,9 +286,12 @@ fn phases(
         for ready in readiness {
             receive(ready)?;
         }
+        drop(loaded);
         observer.phase_started(&phase);
         let began = Instant::now();
         start.send_replace(Some(began));
+        let machine =
+            load_window(&heard, began + phase.duration, &phase, observer);
         let mut counts = Counts::default();
         let mut at_target = 0;
         let mut failure = None;
@@ -322,6 +329,7 @@ fn phases(
             tls,
             completed: failure.is_none() && !stop.is_cancelled(),
             cancelled: stop.is_cancelled(),
+            machine,
         };
         stats.phases += 1;
         stats.total.add(counts);
@@ -353,6 +361,36 @@ fn phases(
         level = plan.max.map_or(next, |max| next.min(max));
         index = index.checked_add(1).ok_or(BreakReason::Overflow)?;
     }
+}
+
+/// Wait for the phase to load and for its admission to end, and read the
+/// machine at both. Each wait ends on a worker's event or at the end the plan
+/// declared for the phase, whichever comes first; a worker that finishes
+/// early ends the load early.
+fn load_window(
+    heard: &mpsc::Receiver<crate::load::PhaseEvent>,
+    end: Instant,
+    phase: &Phase,
+    observer: &mut (impl Observer + ?Sized),
+) -> Option<crate::MachineCpu> {
+    use crate::load::PhaseEvent;
+    let mut loaded = None;
+    loop {
+        match heard.recv_timeout(end.saturating_duration_since(Instant::now()))
+        {
+            Ok(PhaseEvent::Loaded) if loaded.is_none() => {
+                loaded = Some(crate::MachineSample::read());
+                observer.phase_loaded(phase);
+            }
+            Ok(PhaseEvent::Loaded) => {}
+            Ok(PhaseEvent::Finished)
+            | Err(mpsc::RecvTimeoutError::Timeout)
+            | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let ended = crate::MachineSample::read();
+    observer.phase_load_ended(phase);
+    loaded.flatten()?.until(ended?)
 }
 
 #[cfg(test)]

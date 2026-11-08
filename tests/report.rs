@@ -22,6 +22,7 @@ fn perfect_status_counts_do_not_pass_when_concurrency_was_not_established() {
         tls: None,
         completed: true,
         cancelled: false,
+        machine: None,
     };
     let accept = "99.99".parse().unwrap();
     assert!(!measured.accepted(accept));

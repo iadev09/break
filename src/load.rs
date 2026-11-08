@@ -1,4 +1,49 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
+
+/// What a phase's owner hears from its workers while the load runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhaseEvent {
+    /// The last of the phase's connections first carried its full depth.
+    Loaded,
+    /// A worker finished its part of the phase.
+    Finished,
+}
+
+/// Counts a phase's connections down to the last one that first carries its
+/// full depth, and tells the phase's owner once.
+pub(crate) struct Loaded {
+    remaining: AtomicUsize,
+    events: Sender<PhaseEvent>,
+}
+
+impl Loaded {
+    pub(crate) fn new(
+        connections: usize,
+        events: Sender<PhaseEvent>,
+    ) -> Self {
+        Self { remaining: AtomicUsize::new(connections), events }
+    }
+
+    fn reached(&self) {
+        // Replacement owners in the connection test count too; past zero
+        // there is nothing more to say.
+        if self.remaining.try_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |left| left.checked_sub(1),
+        ) == Ok(1)
+        {
+            let _ = self.events.send(PhaseEvent::Loaded);
+        }
+    }
+
+    pub(crate) fn finished(&self) {
+        let _ = self.events.send(PhaseEvent::Finished);
+    }
+}
 
 /// Client-observed load during admission. Drain is excluded from the integrals.
 #[derive(Clone, Copy, Debug, Default)]
@@ -75,6 +120,7 @@ fn ratio(
 }
 
 pub(crate) struct Meter {
+    loaded: Option<Arc<Loaded>>,
     start: Instant,
     end: Instant,
     last: Instant,
@@ -89,8 +135,10 @@ impl Meter {
         start: Instant,
         duration: Duration,
         target: usize,
+        loaded: Option<Arc<Loaded>>,
     ) -> Self {
         Self {
+            loaded,
             start,
             end: start + duration,
             last: start,
@@ -114,10 +162,16 @@ impl Meter {
         }
         self.last = until;
         self.depth = depth;
-        if depth == self.target && now < self.end && self.closed.is_none() {
-            self.stats
-                .latest_first_target
-                .get_or_insert(now.duration_since(self.start));
+        if depth == self.target
+            && now < self.end
+            && self.closed.is_none()
+            && self.stats.latest_first_target.is_none()
+        {
+            self.stats.latest_first_target =
+                Some(now.duration_since(self.start));
+            if let Some(loaded) = &self.loaded {
+                loaded.reached();
+            }
         }
     }
 
@@ -160,7 +214,7 @@ mod tests {
     #[test]
     fn one_attainment_does_not_claim_sustained_load_and_drain_adds_no_area() {
         let start = Instant::now();
-        let mut meter = Meter::new(start, Duration::from_secs(10), 4);
+        let mut meter = Meter::new(start, Duration::from_secs(10), 4, None);
         meter.change(4, start + Duration::from_secs(2));
         meter.change(1, start + Duration::from_secs(3));
         meter.change(0, start + Duration::from_secs(12));
@@ -176,7 +230,7 @@ mod tests {
     #[test]
     fn cancelling_admission_freezes_area_while_pending_work_drains() {
         let start = Instant::now();
-        let mut meter = Meter::new(start, Duration::from_secs(10), 4);
+        let mut meter = Meter::new(start, Duration::from_secs(10), 4, None);
         meter.change(4, start + Duration::from_secs(1));
         meter.close_admission(start + Duration::from_secs(3));
         meter.change(0, start + Duration::from_secs(8));
@@ -190,10 +244,10 @@ mod tests {
     {
         let start = Instant::now();
         let end = start + Duration::from_secs(10);
-        let mut first = Meter::new(start, Duration::from_secs(10), 2);
+        let mut first = Meter::new(start, Duration::from_secs(10), 2, None);
         first.change(2, start);
         first.change(0, start + Duration::from_secs(5));
-        let mut second = Meter::new(start, Duration::from_secs(10), 2);
+        let mut second = Meter::new(start, Duration::from_secs(10), 2, None);
         second.change(2, start + Duration::from_secs(5));
         let mut stats = first.finish(end);
         stats.add(second.finish(end));
