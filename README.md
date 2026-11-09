@@ -246,9 +246,9 @@ lateness expose generator pressure. They do not independently identify server
 time, network time or client scheduling delay. A worker thread turns its
 connections in the order their work arrives; a write burst ends with the free
 request slots or with a full socket, and reads are served before the next.
-Both protocols use a Mio readiness loop. HTTP/2 uses a buffer-driven protocol
-session; request deadlines are stored by the worker rather than registered as
-individual runtime timers.
+Both protocols use a Mio readiness loop. HTTP/2 uses the buffer-driven client
+from [h2-forked](https://crates.io/crates/h2-forked); request deadlines are stored
+by the worker rather than registered as individual runtime timers.
 
 `timeout`, `transport`, `abandoned`, `connect`, `connect-timeout`, `status` and
 `body` are separate failed-attempt categories. Retiring an ordered connection

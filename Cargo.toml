@@ -59,7 +59,7 @@ http = "1"
 httparse = "1"
 
 # Optional HTTP/2 framing
-h2 = { version = "0.4.20", path = "../../forked/h2", features = ["sans-io"], optional = true }
+h2 = { package = "h2-forked", version = "0.4.20", features = ["sans-io"], optional = true }
 
 # Optional TLS transport
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }

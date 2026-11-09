@@ -70,7 +70,7 @@
   The target may declare the version, key exchange group and cipher suite it
   offers; what a connection negotiated is reported with each phase.
 - `src/http2.rs`: a concrete connection for the same readiness engine, using
-  the buffer-driven `h2::client::sans_io::Session`. It drains typed response
+  the buffer-driven `h2::client::sans_io::Session` from `h2-forked`. It drains typed response
   events and keeps request state and FIFO deadline identifiers in reusable
   connection-owned storage. Responses may complete out of order. An expired
   request resets only its own stream; there is no per-stream Tokio timer,
