@@ -444,4 +444,35 @@ never added as zero-duration replies; read the error counts alongside the mean.
 Workers merge sums and counts, rather than averaging connection means. No
 per-request task, shared counter, allocation or additional clock read is added.
 
+## Benchmark the client
+
+The custom Cargo bench measures `brk` itself against a fixed `ok` responder in
+another process, over cleartext HTTP/1.1 or HTTP/2 with prior knowledge:
+
+```sh
+mkdir -p .benchmarks
+cargo bench --bench client -- \
+  --connections 128 --depths 1,8 --threads 1,2 --server-threads 4 \
+  --phase 10s --timeout 100ms --repeat 2 > .benchmarks/client.csv
+```
+
+Each combination is a separate fixed-load phase. There is no implicit warmup;
+protocol order reverses on alternate repetitions. CSV rows include throughput,
+user/system client CPU, CPU microseconds per attempt and per success, actual
+thread count, coverage, errors and responder CPU. CPU counters use Unix
+`getrusage`: the client window excludes target resolution and worker startup,
+and includes connection setup, traffic and drain. Responder counters bracket
+that window through a control pipe; its CPU is never added to the client's.
+Connections are assigned round-robin to responder workers once at accept;
+requests stay on that worker. The responder's accept/control threads are also
+included in its process CPU.
+
+The best accepted rate is observed throughput, not an isolated client ceiling.
+Check errors, coverage and client/responder CPU together. Aggregate responder
+CPU cannot rule out one saturated responder thread. Repeat with more
+`--server-threads`, or use `--url http://127.0.0.1:8080/plain` instead, to check
+whether the responder limits the run. An external target must return exactly
+`ok`; select its protocol with `--protocols h1` or `--protocols h2`. Its CPU is
+not collected. TLS is outside this bench's comparison.
+
 Licensed under MIT OR Apache-2.0.

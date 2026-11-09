@@ -178,3 +178,21 @@ the phase contract.
   bytes, not only length; HTTP/2 tests cover bodies larger than a flow window,
   over cleartext and TLS. TLS tests also cover explicit verification opt-out.
   No deployment/server framework.
+
+## Client cost bench
+
+`benches/client.rs` is a custom executable harness, not a unit test or a change
+to the library's request path. `benches/client/config.rs` declares the matrix
+and timing budgets; `fixture.rs` owns a separate responder process and its
+current-thread runtimes, with a round-robin acceptor assigning each connection
+once; `cpu.rs` reads process-wide user/system counters;
+`report.rs` measures through `Observer` and writes raw CSV rows. Every row uses
+one fixed-depth phase with an exact `ok` response, over H1 or H2c.
+
+The caller's CPU window covers setup, traffic and drain but excludes target
+resolution and worker startup. Responder control samples fall just outside
+those boundaries and are reported separately. Completion counts are the client's, with no shared
+per-request benchmark counter. Runs report errors and target coverage alongside
+CPU cost and rate; neither acceptance nor aggregate responder CPU proves an
+isolated client ceiling. Closing the child control pipe stops its listeners
+and owned connections; no deployment service or persistent socket is used.

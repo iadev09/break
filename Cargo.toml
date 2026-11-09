@@ -38,6 +38,12 @@ name = "brk"
 path = "src/bin/brk.rs"
 required-features = ["cli"]
 
+[[bench]]
+name = "client"
+path = "benches/client.rs"
+harness = false
+required-features = ["cli", "http2"]
+
 [features]
 default = ["cli", "tls", "http2"]
 cli = ["dep:clap", "dep:ctrlc", "dep:humantime"]
