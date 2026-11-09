@@ -26,30 +26,6 @@ pub(crate) struct Head {
     pub(crate) send: Option<Bytes>,
 }
 
-/// Send a request body as the peer's flow control allows, in slices of the
-/// one shared buffer.
-async fn send_body(
-    mut stream: h2::SendStream<Bytes>,
-    mut rest: Bytes,
-) -> Result<(), h2::Error> {
-    if rest.is_empty() {
-        return stream.send_data(rest, true);
-    }
-    while !rest.is_empty() {
-        stream.reserve_capacity(rest.len());
-        let capacity = match poll_fn(|cx| stream.poll_capacity(cx)).await {
-            Some(capacity) => capacity?,
-            None => return Err(h2::Error::from(h2::Reason::CANCEL)),
-        };
-        if capacity == 0 {
-            continue;
-        }
-        let chunk = rest.split_to(capacity.min(rest.len()));
-        stream.send_data(chunk, rest.is_empty())?;
-    }
-    Ok(())
-}
-
 pub(crate) struct Connection {
     send: h2::client::SendRequest<Bytes>,
     /// The connection's own work: frames move only while this is polled.
@@ -92,7 +68,10 @@ async fn stream(
     // before the request has ended.
     let send = async move {
         match sending {
-            Some((stream, body)) => send_body(stream, body).await,
+            // Each stream queues one slice of the fixed, shared request body.
+            // h2 applies wire flow control. No capacity waiter competes with
+            // SendRequest::poll_ready for a pending stream's send-side waker.
+            Some((mut stream, body)) => stream.send_data(body, true),
             None => Ok(()),
         }
     };

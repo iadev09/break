@@ -23,4 +23,7 @@ core.*
 *.local.*
 *.local
 
-
+# docs
+*.md
+!README.md
+!ARCHITECTURE.md

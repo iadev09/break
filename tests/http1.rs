@@ -18,6 +18,8 @@ enum Mode {
     Truncated,
     CloseDelimited,
     Ambiguous,
+    Echo,
+    CorruptEcho,
 }
 
 #[derive(Default)]
@@ -131,9 +133,26 @@ fn handle(
     let mut writer = stream.try_clone().unwrap();
     let (reply, replies) = mpsc::channel();
     let output = thread::spawn(move || {
-        for status in replies {
+        for (status, body) in replies {
             if let Some(gate) = &gate {
                 gate.wait();
+            }
+            if matches!(mode, Mode::Echo | Mode::CorruptEcho) {
+                let mut body: Vec<u8> = body;
+                if matches!(mode, Mode::CorruptEcho) {
+                    body[0] ^= 1;
+                }
+                if write!(
+                    writer,
+                    "HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .and_then(|()| writer.write_all(&body))
+                .is_err()
+                {
+                    break;
+                }
+                continue;
             }
             let response = match mode {
                 Mode::Fixed => format!(
@@ -148,6 +167,7 @@ fn handle(
                 Mode::CloseDelimited => format!(
                     "HTTP/1.1 {status} fixture\r\nConnection: close\r\n\r\nok"
                 ),
+                Mode::Echo | Mode::CorruptEcho => unreachable!(),
                 Mode::Ambiguous => format!(
                     "HTTP/1.1 {status} fixture\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
                 ),
@@ -172,12 +192,31 @@ fn handle(
         while let Some(end) =
             buffered.windows(4).position(|bytes| bytes == b"\r\n\r\n")
         {
-            buffered.drain(..end + 4);
+            let head = std::str::from_utf8(&buffered[..end]).unwrap();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if buffered.len() < end + 4 + length {
+                break;
+            }
+            if matches!(mode, Mode::Echo | Mode::CorruptEcho) {
+                assert!(head.starts_with("POST /plain HTTP/1.1\r\n"));
+                assert!(
+                    head.contains("content-type: application/octet-stream")
+                );
+            }
+            let body = buffered[end + 4..end + 4 + length].to_vec();
+            buffered.drain(..end + 4 + length);
             requests.fetch_add(1, Ordering::Relaxed);
             if let Some(arrivals) = &arrivals {
                 let _ = arrivals.send(());
             }
-            if reply.send(status.load(Ordering::Acquire)).is_err() {
+            if reply.send((status.load(Ordering::Acquire), body)).is_err() {
                 break;
             }
         }
@@ -649,4 +688,35 @@ fn cli_ctrl_c_drains_owned_requests_and_exits_130() {
     assert!(signalled);
     assert_eq!(result.status.code(), Some(130));
     assert!(String::from_utf8_lossy(&result.stderr).contains("Cancelled"));
+}
+
+#[test]
+fn pipelined_post_echo_checks_binary_contents_not_only_length() {
+    let body = vec![0, 0xff, b'\r', b'\n', b'o', b'k'];
+    for mode in [Mode::Echo, Mode::CorruptEcho] {
+        let fixture = Fixture::new(mode, false);
+        let target = Target::new(&format!("http://{}/plain", fixture.address))
+            .unwrap()
+            .post_body(body.clone())
+            .expect_echo();
+        let result =
+            brk::run(&target, plan(), &CancellationToken::new(), &mut ());
+        match mode {
+            Mode::Echo => {
+                let done = result.unwrap();
+                assert!(done.stats.total.successful > 4);
+                assert_eq!(done.stats.total.failed(), 0);
+            }
+            Mode::CorruptEcho => {
+                let broken = result.unwrap_err();
+                assert!(matches!(broken.reason, BreakReason::Acceptance));
+                assert_eq!(broken.stats.total.successful, 0);
+                assert_eq!(
+                    broken.stats.total.body,
+                    broken.stats.total.attempted
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
 }

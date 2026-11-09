@@ -258,3 +258,14 @@ fn a_declared_tls_offer_is_what_gets_negotiated_and_reported() {
         .unwrap_err();
     assert!(matches!(broken.reason, BreakReason::Invalid(_)));
 }
+
+#[test]
+fn explicit_verification_opt_out_accepts_a_self_signed_server() {
+    let fixture = Fixture::new();
+    let target = fixture.target().without_verification();
+    let done =
+        brk::run(&target, plan(), &CancellationToken::new(), &mut ()).unwrap();
+    assert!(done.stats.total.successful > 0);
+    assert_eq!(done.stats.total.failed(), 0);
+    assert!(done.stats.last_phase.unwrap().tls.is_some());
+}

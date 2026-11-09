@@ -50,12 +50,19 @@ Exit codes: `0` Done, `1` Broken, `2` argument parsing errors, `130` Ctrl-C.
 - `--max`: optional per-connection ceiling. Without it there is no fixed final
   phase. Reaching it reports tested load, not a server breakpoint.
 - `--expect-body`: additionally require an exact response body.
+- `--body-file`: POST a file with every request; `-` reads standard input.
+- `--expect-echo`: require the response body to match the bytes sent with
+  `--body-file`.
+- `--baseline`: measure machine CPU for one `--phase` with no benchmark traffic
+  before starting the load (Linux).
 - `--threads`: client worker threads. Optional, but advised. Not part of the
   load; see [What `--threads` is](#what---threads-is).
 - `--connect`: connect to this address instead of resolving the URL's host. The
   URL still supplies the `Host` header and, for `https://`, the server name.
 - `--cacert`: for `https://`, trust the authorities in this PEM file instead of
   the platform's.
+- `--insecure`: for `https://`, skip server certificate verification. It cannot
+  be combined with `--cacert`; encryption remains enabled.
 
 Phase zero targets `conn × start` requests. Phase `n` targets
 `conn × (start + n × pace)`. A completed request frees one slot and immediately
@@ -106,7 +113,8 @@ boundary found belongs to client and server together: use it to compare
 servers under the same conditions, not as one server's capacity. The run prints
 how many worker threads it started.
 
-The adapter implements HTTP/1.1 GET with actual pipelining on each connection.
+The adapter sends GET requests by default, or POST requests with `--body-file`,
+with actual HTTP/1.1 pipelining on each connection.
 Requests admitted together are written together: one write carries as many as
 the socket takes, and each keeps its own admission time and deadline.
 It reads ordered responses while filling free request slots, reuses connections
@@ -116,16 +124,30 @@ ambiguous framing is an explicit error. Pipelined outstanding requests are a
 client-side measure, not a claim that all server handlers execute simultaneously.
 
 The URL's scheme selects the transport: `http://` is TCP, `https://` is TLS on the
-same connection model, with the same pipelining and the same outcomes. There is
-no protocol-selection flag. The handshake belongs to connection setup: it counts
-against the first request's deadline, and a certificate that does not verify is a
-setup failure, never a measured request. Verification is always on. A connection
-that ends without a TLS close is a transport failure, not a complete body. The
+same connection model, with the same pipelining and the same outcomes. It uses
+HTTP/1.1 by default; `--http2` selects HTTP/2. The handshake belongs to
+connection setup: it counts against the first request's deadline. Certificate
+verification is enabled by default; a verification failure is a setup failure.
+Use `--cacert` for a private authority, or `--insecure` to explicitly disable
+server identity verification. A connection that ends without a TLS close is a
+transport failure, not a complete body. The
 `tls` feature is enabled by default; a build without it accepts `http://` only.
 
 ```sh
 brk https://example.test/plain --connect 127.0.0.1:8443 --cacert authority.pem \
   --conn 64 --start 2 --pace 2 --phase 10s --timeout 16ms
+```
+
+## POST and echo validation
+
+`--body-file` reads the file once before load starts. Every request sends those
+bytes as a POST with `Content-Length` and `Content-Type: application/octet-stream`.
+`--expect-echo` compares the complete response body with the sent buffer, without
+text decoding. Both work over HTTP/1.1 and HTTP/2.
+
+```sh
+brk http://127.0.0.1:8080/echo --body-file payload.bin --expect-echo \
+  --conn 64 --start 2 --pace 2 --phase 10s --timeout 100ms --accept 99.99
 ```
 
 ## Two tests
@@ -239,6 +261,22 @@ phase brackets this run's observed boundary, at the declared pace resolution.
 The runner does not repeat, refine or claim a confidence interval. An explicit
 `--max` is tested even when it lies between normal pace levels.
 
+### Machine CPU and baseline
+
+On Linux, each phase reports machine-wide CPU use over its loaded window,
+from first attainment of the target on every connection to the end of admission.
+`PhaseStats::machine` exposes this reading to library callers. It includes all
+processes on the machine, not only the server or client; a phase that never
+reaches its target has no loaded-window reading.
+
+`--baseline` first observes the machine for one `--phase` without sending test
+traffic. This shows background activity beside the loaded measurements; it is
+not subtracted from them. Busy CPUs and the remaining share describe observed
+usage, not reserved capacity or proof that the application could use every idle
+CPU. Process CPU, affinity and container limits must be assessed separately.
+Machine CPU readings are currently implemented only on Linux; other platforms
+report them as unavailable.
+
 ## Known limits
 
 - **HTTP/2 costs the client several times what HTTP/1.1 does.** Its framing
@@ -258,8 +296,8 @@ The runner does not repeat, refine or claim a confidence interval. An explicit
   count.
 - **Over TLS, HTTP/1.1 makes one read that finds nothing for each response.**
   That is client cost only and changes no outcome.
-- **The request is a fixed GET.** No request body, no headers of your own, no
-  scenario file, no warmup.
+- **Requests are GET or fixed-body POST.** No custom headers, scenario file
+  or warmup.
 - **It has been run on Linux and macOS.** Nothing else has been tried.
 
 ## Library
@@ -279,8 +317,16 @@ That program decides everything around the load:
 It decides nothing on the request path, and that is the point. A callback per
 request would be the client's own cost and would change what is measured.
 Yours run between phases, on the calling thread, and the compiler checks them
-before a single request is sent. The request itself is a fixed GET with an
-optional exact status and body.
+before a single request is sent. The target is a GET or fixed-body POST with
+optional exact status and body validation.
+
+```toml
+[dependencies]
+brk = { package = "break", version = "0.2.1", default-features = false }
+```
+
+Add `features = ["tls", "http2"]` when those transports are needed. CLI parsing
+is optional and is not required by library callers.
 
 ```rust,no_run
 use std::time::Duration;
@@ -325,6 +371,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+```
+
+For a POST target, prepare the body once and enable echo validation if needed:
+
+```rust,no_run
+# use brk::Target;
+let target = Target::new("http://127.0.0.1:8080/echo")?
+    .post_body(std::fs::read("payload.bin")?)
+    .expect_echo();
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `run(&target, plan, &cancellation, &mut observer)` returns `Result<Done, Broken>`;

@@ -37,8 +37,44 @@ async fn serve<I: AsyncRead + AsyncWrite + Unpin>(
     let Ok(mut connection) = builder.handshake::<_, Bytes>(io).await else {
         return;
     };
-    while let Some(Ok((_request, mut respond))) = connection.accept().await {
+    while let Some(Ok((request, mut respond))) = connection.accept().await {
         requests.fetch_add(1, Ordering::Relaxed);
+        if request.method() == http::Method::POST {
+            tokio::spawn(async move {
+                let corrupt = request.uri().path() == "/corrupt";
+                assert_eq!(
+                    request.headers()["content-type"],
+                    "application/octet-stream"
+                );
+                let expected: usize = request.headers()["content-length"]
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let mut incoming = request.into_body();
+                let mut body = Vec::new();
+                while let Some(chunk) = incoming.data().await {
+                    let Ok(chunk) = chunk else {
+                        return;
+                    };
+                    body.extend_from_slice(&chunk);
+                    incoming
+                        .flow_control()
+                        .release_capacity(chunk.len())
+                        .unwrap();
+                }
+                assert_eq!(body.len(), expected);
+                if corrupt {
+                    body[0] ^= 1;
+                }
+                let response =
+                    http::Response::builder().status(200).body(()).unwrap();
+                if let Ok(mut send) = respond.send_response(response, false) {
+                    let _ = send.send_data(Bytes::from(body), true);
+                }
+            });
+            continue;
+        }
         let response = http::Response::builder().status(200).body(()).unwrap();
         if let Ok(mut send) = respond.send_response(response, false) {
             let _ = send.send_data(Bytes::from_static(b"ok"), true);
@@ -234,5 +270,45 @@ fn the_connection_test_replaces_connections_after_their_streams() {
         // two a phase end interrupted may have carried fewer, down to none.
         assert!(requests <= 3 * setups.established, "{secure}");
         assert!(requests + 6 >= 3 * setups.established, "{secure}");
+    }
+}
+
+#[test]
+fn post_echo_checks_binary_contents_over_cleartext_and_tls_streams() {
+    let body: Vec<u8> = (0..131_072).map(|n| n as u8).collect();
+    for secure in [false, true] {
+        for corrupt in [false, true] {
+            let fixture = Fixture::new(secure, None);
+            let scheme = if secure { "https" } else { "http" };
+            let path = if corrupt { "corrupt" } else { "echo" };
+            let mut target = Target::new(&format!("{scheme}://{NAME}/{path}"))
+                .unwrap()
+                .connect_to(fixture.address)
+                .http2()
+                .post_body(body.clone())
+                .expect_echo();
+            if let Some(authority) = &fixture.authority {
+                target = target.trust_pem(authority.as_bytes()).unwrap();
+            }
+            let result = brk::run(
+                &target,
+                Plan { max_concurrency: Some(2), ..plan() },
+                &CancellationToken::new(),
+                &mut (),
+            );
+            if corrupt {
+                let broken = result.unwrap_err();
+                assert!(matches!(broken.reason, BreakReason::Acceptance));
+                assert_eq!(broken.stats.total.successful, 0);
+                assert_eq!(
+                    broken.stats.total.body,
+                    broken.stats.total.attempted
+                );
+            } else {
+                let done = result.unwrap();
+                assert!(done.stats.total.successful > 0);
+                assert_eq!(done.stats.total.failed(), 0);
+            }
+        }
     }
 }

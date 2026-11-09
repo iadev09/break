@@ -31,7 +31,8 @@
   budget: the budget is per task, and shared by a thread's connections it
   starved the ones not answered first.
 - `src/http1.rs`: target validation, cold address resolution and reusable GET
-  bytes. Transport-specific preparation remains behind the root API.
+  or fixed-body POST bytes. Echo validation shares the sent buffer.
+  Transport-specific preparation remains behind the root API.
 - `src/http1/engine.rs`: the HTTP/1.1 readiness loop of a worker thread. It
   asks the kernel which sockets changed, remembers each socket's readable and
   writable side until a read finds nothing or a write finds no room, and turns
@@ -70,8 +71,11 @@
   future per connection polls the connection's driver, opens streams while the
   level and the peer's limit allow, and collects each stream's outcome. A
   stream has its own deadline; missing it drops and resets that stream alone.
-  Setup ends when the peer's settings have arrived. The framing drives the
-  transport through polls, which the TCP stream and the TLS session answer.
+  Setup ends when the peer's settings have arrived. Each POST stream queues
+  one shared body buffer; h2 frames it under the peer's flow-control windows.
+  There is no separate body-capacity waiter competing with request readiness
+  for a pending stream's send-side waker. The framing drives the transport
+  through polls, which the TCP stream and the TLS session answer.
 - `src/http1/decode.rs`: incremental response framing with httparse. Handles
   interim responses, Content-Length, chunked/trailers, close-delimited bodies and
   coalesced/fragmented replies. Payload bytes are checked in place. Ambiguous or
@@ -109,8 +113,11 @@ all admitted attempts retain their deadlines until completion/failure. Only afte
 all workers report does the caller invoke `phase_finished`. Live connections are
 retained for the next phase; its counters are fresh.
 
-Both callbacks bracket setup/traffic/drain, excluding DNS and worker startup.
-CPU/RSS collection is downstream work and never part of the request loop.
+Start/finish callbacks bracket setup/traffic/drain, excluding DNS and worker
+startup. The loaded/end-of-admission callbacks delimit a narrower machine CPU
+window. `src/cpu.rs` reads Linux kernel counters at those boundaries;
+`PhaseStats::machine` carries the machine-wide delta. Process CPU/RSS collection
+remains downstream work, outside the request loop.
 A client that cannot write the requested pipeline depth on every connection is
 `Broken::Unfulfilled`, not a capacity success. Invalid input, I/O, allocation,
 protocol errors and cancellation remain distinct from HTTP acceptance failure.
@@ -127,9 +134,13 @@ admission and joins its threads, including during callback unwinding.
 - `src/cli.rs`: arguments, Ctrl-C ownership and phase/result output.
 - `src/bin/brk.rs`: CLI entry point.
 
-Transport: HTTP/1.1 GET over TCP or, selected by an `https://` URL, over TLS. No
-protocol selector, warmup or scenario loader is advertised. Concurrency is outstanding client work, not server-handler
-parallelism. Protocol-specific scheduling does not change the phase contract.
+Requests are GET or fixed-body POST, over TCP or TLS. HTTP/1.1 is the default;
+`--http2` selects HTTP/2 with cleartext prior knowledge or TLS ALPN. Certificate
+verification is enabled unless explicitly disabled with `--insecure`. The CLI
+can measure a no-traffic machine CPU baseline for the declared phase duration.
+There is no warmup or scenario loader. Concurrency is outstanding client work,
+not server-handler parallelism. Protocol-specific scheduling does not change
+the phase contract.
 
 ## Tests
 
@@ -158,8 +169,12 @@ parallelism. Protocol-specific scheduling does not change the phase contract.
   cleartext and over TLS: streams multiplying on fixed connections, a peer's
   stream limit leaving a phase unfulfilled, and connections replaced after
   their streams.
-- `tests/cli.rs`: the two tests' names, short forms and separate options.
+- `tests/cli.rs`: the two tests' names, short forms, separate options, POST/echo
+  arguments and incompatible TLS verification options.
 - `src/cli.rs`: numeric load controls and unsupported-option rejection.
 - `tests/http1.rs`: real ephemeral TCP fixtures; fixed connections and growing
   pipelines, callback ordering, per-phase counters, body/deadline failures,
-  resource/setup errors, cancellation and drain. No deployment/server framework.
+  resource/setup errors, cancellation and drain. Binary POST echoes must match
+  bytes, not only length; HTTP/2 tests cover bodies larger than a flow window,
+  over cleartext and TLS. TLS tests also cover explicit verification opt-out.
+  No deployment/server framework.

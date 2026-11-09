@@ -60,3 +60,49 @@ fn each_test_has_its_name_its_short_form_and_only_its_own_options() {
         assert!(parsed(&arguments).is_err(), "{name}");
     }
 }
+
+#[test]
+fn post_echo_requires_a_body_file_and_baseline_is_independent() {
+    let mut arguments = vec![
+        "brk",
+        URL,
+        "--conn",
+        "1",
+        "--pace",
+        "1",
+        "--phase",
+        "1s",
+        "--timeout",
+        "1s",
+        "--expect-echo",
+    ];
+    assert!(parsed(&arguments).is_err());
+    arguments.extend(["--body-file", "-", "--baseline"]);
+    let Test::Requests(args) = parsed(&arguments).unwrap().test else {
+        panic!("request test expected");
+    };
+    assert!(args.common.expect_echo);
+    assert!(args.common.baseline);
+    assert_eq!(args.common.body_file.unwrap().as_os_str(), "-");
+}
+
+#[cfg(feature = "tls")]
+#[test]
+fn insecure_cannot_be_combined_with_a_trust_file() {
+    let mut arguments = vec![
+        "brk",
+        URL,
+        "--conn",
+        "1",
+        "--pace",
+        "1",
+        "--phase",
+        "1s",
+        "--timeout",
+        "1s",
+        "--insecure",
+    ];
+    assert!(parsed(&arguments).is_ok());
+    arguments.extend(["--cacert", "authority.pem"]);
+    assert!(parsed(&arguments).is_err());
+}
