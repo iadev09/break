@@ -50,7 +50,7 @@ cli = ["dep:clap", "dep:ctrlc", "dep:humantime"]
 # `https://` targets: HTTP/1.1 over TLS, with the same pipelining.
 tls = ["dep:rustls", "dep:rustls-native-certs"]
 # `--http2`: the same tests over HTTP/2 streams.
-http2 = ["dep:h2"]
+http2 = ["dep:h2", "dep:fnv"]
 
 [dependencies]
 # HTTP/1 transport
@@ -59,17 +59,17 @@ http = "1"
 httparse = "1"
 
 # Optional HTTP/2 framing
-h2 = { version = "0.4", optional = true }
+h2 = { version = "0.4.20", path = "../../forked/h2", features = ["sans-io"], optional = true }
 
 # Optional TLS transport
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 
-# The HTTP/1.1 readiness loop
+# Shared protocol readiness loop
 mio = { version = "1", features = ["os-poll", "net"] }
 
-# Coordination, and the executor HTTP/2 framing runs on
-futures-util = "0.3"
+# Phase coordination and test/benchmark responders
+fnv = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"

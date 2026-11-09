@@ -1,6 +1,6 @@
-mod connection;
+pub(crate) mod connection;
 mod decode;
-mod engine;
+pub(crate) mod engine;
 mod transport;
 
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -10,12 +10,6 @@ use bytes::Bytes;
 use http::{StatusCode, Uri};
 
 use crate::{BreakReason, Counts};
-#[cfg(feature = "http2")]
-pub(crate) use connection::{Carrier, End, Summary, Window, open, run_owner};
-pub(crate) use engine::serve;
-#[cfg(feature = "http2")]
-pub(crate) use transport::{Sessions, Transport};
-
 /// One GET target, or a POST with a body, and optional exact response validation.
 ///
 /// An `http://` URL is requested over TCP, an `https://` URL over TLS on the

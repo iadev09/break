@@ -246,8 +246,9 @@ lateness expose generator pressure. They do not independently identify server
 time, network time or client scheduling delay. A worker thread turns its
 connections in the order their work arrives; a write burst ends with the free
 request slots or with a full socket, and reads are served before the next.
-HTTP/1.1 runs on a readiness loop of its own with no task, waker or timer per
-connection; HTTP/2 framing runs on Tokio.
+Both protocols use a Mio readiness loop. HTTP/2 uses a buffer-driven protocol
+session; request deadlines are stored by the worker rather than registered as
+individual runtime timers.
 
 `timeout`, `transport`, `abandoned`, `connect`, `connect-timeout`, `status` and
 `body` are separate failed-attempt categories. Retiring an ordered connection
@@ -279,13 +280,14 @@ report them as unavailable.
 
 ## Known limits
 
-- **HTTP/2 costs the client several times what HTTP/1.1 does.** Its framing
-  still runs on Tokio with a timer for every stream, where HTTP/1.1 has a
-  readiness loop of its own. On one 40-CPU Linux machine, over TLS, a request
-  cost the client about 16 µs of CPU at 16 streams a connection, against
-  three to four over HTTP/1.1. Give an HTTP/2 run more client threads, and
-  read its rate with the next point in mind. A cheaper HTTP/2 path is
-  intended and is not the priority.
+- **HTTP/2 has additional protocol and stream-state costs.** The current
+  development path uses a Sans-I/O H2 session on Mio. It retains HPACK, flow
+  control and protocol checks. Header construction and the protocol library's
+  stream ownership still cost CPU. The small cleartext-response benchmark on
+  macOS currently regresses in CPU per response and throughput against the
+  previous async client; scheduling and batching remain under investigation.
+  Use the client benchmark below to measure CPU per response and sustained
+  target coverage.
 - **The rate can be the client's while every diagnostic is clean.** A client
   whose threads are full still keeps the declared requests outstanding and
   still reads their responses within the deadline, only later. Coverage stays

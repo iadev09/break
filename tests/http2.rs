@@ -37,8 +37,14 @@ async fn serve<I: AsyncRead + AsyncWrite + Unpin>(
     let Ok(mut connection) = builder.handshake::<_, Bytes>(io).await else {
         return;
     };
+    let mut held = Vec::new();
     while let Some(Ok((request, mut respond))) = connection.accept().await {
-        requests.fetch_add(1, Ordering::Relaxed);
+        let ordinal = requests.fetch_add(1, Ordering::Relaxed);
+        if request.uri().path() == "/one-slow" && ordinal == 0 {
+            // Keep exactly one response open without a timer or a blocked driver.
+            held.push(respond);
+            continue;
+        }
         if request.method() == http::Method::POST {
             tokio::spawn(async move {
                 let corrupt = request.uri().path() == "/corrupt";
@@ -311,4 +317,26 @@ fn post_echo_checks_binary_contents_over_cleartext_and_tls_streams() {
             }
         }
     }
+}
+
+#[test]
+fn an_expired_stream_is_reset_without_stalling_the_other_streams() {
+    let fixture = Fixture::new(false, None);
+    let target = Target::new(&format!("http://{}/one-slow", fixture.address))
+        .unwrap()
+        .http2();
+    let plan = Plan {
+        start: 4,
+        max_concurrency: Some(4),
+        timeout: Duration::from_millis(100),
+        accept: 100.0,
+        ..plan()
+    };
+    let broken = brk::run(&target, plan, &CancellationToken::new(), &mut ())
+        .unwrap_err();
+    let phase = broken.stats.last_phase.unwrap();
+    assert_eq!(phase.counts.timeout, 1);
+    assert!(phase.counts.successful > 16);
+    assert_eq!(phase.counts.transport, 0);
+    assert_eq!(phase.counts.abandoned, 0);
 }

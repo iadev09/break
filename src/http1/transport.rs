@@ -1,14 +1,7 @@
 //! What carries one connection's bytes: a TCP stream as it is, or the same
 //! stream under TLS. Both are driven by socket readiness and non-blocking
 //! reads and writes, so the connection loop is the same for either. The TLS
-//! session is one type over either readiness loop: the HTTP/1.1 engine's own
-//! and, for HTTP/2 framing, Tokio's.
-
-#[cfg(feature = "http2")]
-use std::io;
-
-#[cfg(feature = "http2")]
-use tokio::net::TcpStream;
+//! session is driven by the shared Mio engine for either HTTP version.
 
 use super::Client;
 
@@ -29,129 +22,12 @@ pub(crate) fn own_sessions(client: &Client) -> Option<Sessions> {
     }
 }
 
-#[cfg(feature = "http2")]
-pub(crate) enum Transport {
-    Plain(TcpStream),
-    #[cfg(feature = "tls")]
-    Tls(Box<secure::Secure<TcpStream>>),
-}
-
-#[cfg(feature = "http2")]
-impl Transport {
-    /// Take an established TCP stream and, for an `https://` target, complete
-    /// the TLS handshake on it. The caller's deadline covers both. `sessions`
-    /// replaces the target's shared TLS sessions with one owner's own.
-    pub(crate) async fn open(
-        stream: TcpStream,
-        client: &Client,
-        sessions: Option<&Sessions>,
-    ) -> io::Result<Self> {
-        #[cfg(feature = "tls")]
-        if let Some(tls) = sessions.or(client.tls.as_ref()) {
-            return Ok(Self::Tls(Box::new(
-                secure::Secure::handshake(stream, tls).await?,
-            )));
-        }
-        let _ = (client, sessions);
-        Ok(Self::Plain(stream))
-    }
-
-    /// What this connection's TLS handshake settled on.
-    pub(crate) fn negotiated(&self) -> Option<crate::Negotiated> {
-        match self {
-            Self::Plain(_) => None,
-            #[cfg(feature = "tls")]
-            Self::Tls(secure) => secure.negotiated(),
-        }
-    }
-
-    /// Whether this connection's TLS handshake resumed an earlier session.
-    pub(crate) fn resumed(&self) -> bool {
-        match self {
-            Self::Plain(_) => false,
-            #[cfg(feature = "tls")]
-            Self::Tls(secure) => secure.resumed(),
-        }
-    }
-}
-
-/// HTTP/2 framing drives a connection through polls. The same socket and the
-/// same TLS session answer them.
-#[cfg(feature = "http2")]
-mod polled {
-    use std::io;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
-    use super::Transport;
-
-    impl AsyncRead for Transport {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buffer: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            match self.get_mut() {
-                Transport::Plain(stream) => {
-                    Pin::new(stream).poll_read(cx, buffer)
-                }
-                #[cfg(feature = "tls")]
-                Transport::Tls(secure) => secure.poll_read(cx, buffer),
-            }
-        }
-    }
-
-    impl AsyncWrite for Transport {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            bytes: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            match self.get_mut() {
-                Transport::Plain(stream) => {
-                    Pin::new(stream).poll_write(cx, bytes)
-                }
-                #[cfg(feature = "tls")]
-                Transport::Tls(secure) => secure.poll_write(cx, bytes),
-            }
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
-            match self.get_mut() {
-                Transport::Plain(stream) => Pin::new(stream).poll_flush(cx),
-                #[cfg(feature = "tls")]
-                Transport::Tls(secure) => secure.poll_flush(cx),
-            }
-        }
-
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
-            match self.get_mut() {
-                Transport::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-                #[cfg(feature = "tls")]
-                Transport::Tls(secure) => secure.poll_shutdown(cx),
-            }
-        }
-    }
-}
-
 #[cfg(feature = "tls")]
 pub(crate) mod secure {
     use std::io::{self, ErrorKind, Read, Write};
     use std::sync::Arc;
 
     use rustls::pki_types::ServerName;
-    #[cfg(feature = "http2")]
-    use tokio::io::Interest;
-    #[cfg(feature = "http2")]
-    use tokio::net::TcpStream;
 
     /// The prepared client side of every connection to one target.
     #[derive(Clone)]
@@ -208,23 +84,6 @@ pub(crate) mod secure {
         ) -> io::Result<usize> {
             let mut socket = self;
             socket.write(bytes)
-        }
-    }
-
-    #[cfg(feature = "http2")]
-    impl Wire for TcpStream {
-        fn receive(
-            &self,
-            buffer: &mut [u8],
-        ) -> io::Result<usize> {
-            self.try_read(buffer)
-        }
-
-        fn send(
-            &self,
-            bytes: &[u8],
-        ) -> io::Result<usize> {
-            self.try_write(bytes)
         }
     }
 
@@ -380,6 +239,23 @@ pub(crate) mod secure {
             }
         }
 
+        #[cfg(feature = "http2")]
+        pub(in crate::http1) fn close_step(
+            &mut self,
+            writable: &mut bool,
+        ) -> io::Result<bool> {
+            self.session.send_close_notify();
+            if *writable {
+                self.flush()?;
+            }
+            if self.session.wants_write() {
+                *writable = false;
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        }
+
         pub(in crate::http1) fn try_write(
             &mut self,
             bytes: &[u8],
@@ -392,97 +268,6 @@ pub(crate) mod secure {
             let written = self.session.writer().write(bytes)?;
             self.flush()?;
             Ok(written)
-        }
-    }
-
-    /// The asynchronous owner: HTTP/2 framing waits on Tokio's readiness.
-    #[cfg(feature = "http2")]
-    impl Secure<TcpStream> {
-        pub(super) async fn handshake(
-            stream: TcpStream,
-            tls: &Tls,
-        ) -> io::Result<Self> {
-            let mut secure = Self::start(stream, tls)?;
-            while secure.session.is_handshaking() {
-                let interest = match (
-                    secure.session.wants_read(),
-                    secure.session.wants_write(),
-                ) {
-                    (true, true) => Interest::READABLE | Interest::WRITABLE,
-                    (true, false) => Interest::READABLE,
-                    (false, true) => Interest::WRITABLE,
-                    (false, false) => break,
-                };
-                let ready = secure.stream.ready(interest).await?;
-                if ready.is_writable() {
-                    secure.flush()?;
-                }
-                if ready.is_readable() && secure.session.wants_read() {
-                    match secure.receive() {
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        }
-                        other => other?,
-                    }
-                }
-            }
-            secure.flush()?;
-            Ok(secure)
-        }
-    }
-
-    /// The same reads and writes for a caller that polls.
-    #[cfg(feature = "http2")]
-    impl Secure<TcpStream> {
-        pub(super) fn poll_read(
-            &mut self,
-            cx: &mut std::task::Context<'_>,
-            buffer: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<io::Result<()>> {
-            loop {
-                match self.try_read(buffer.initialize_unfilled()) {
-                    Ok(size) => {
-                        buffer.advance(size);
-                        return std::task::Poll::Ready(Ok(()));
-                    }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        std::task::ready!(self.stream.poll_read_ready(cx))?;
-                    }
-                    Err(error) => return std::task::Poll::Ready(Err(error)),
-                }
-            }
-        }
-
-        pub(super) fn poll_write(
-            &mut self,
-            cx: &mut std::task::Context<'_>,
-            bytes: &[u8],
-        ) -> std::task::Poll<io::Result<usize>> {
-            // Records already owed go first, as in `try_write`.
-            std::task::ready!(self.poll_flush(cx))?;
-            let written = self.session.writer().write(bytes)?;
-            self.flush()?;
-            std::task::Poll::Ready(Ok(written))
-        }
-
-        pub(super) fn poll_flush(
-            &mut self,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<io::Result<()>> {
-            loop {
-                self.flush()?;
-                if !self.session.wants_write() {
-                    return std::task::Poll::Ready(Ok(()));
-                }
-                std::task::ready!(self.stream.poll_write_ready(cx))?;
-            }
-        }
-
-        pub(super) fn poll_shutdown(
-            &mut self,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<io::Result<()>> {
-            self.session.send_close_notify();
-            self.poll_flush(cx)
         }
     }
 }

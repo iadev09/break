@@ -3,14 +3,10 @@ use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 use mio::net::TcpStream;
-#[cfg(feature = "http2")]
-use tokio_util::sync::CancellationToken;
 
 use super::decode::Decoder;
 #[cfg(feature = "tls")]
 use super::transport::secure::Secure;
-#[cfg(feature = "http2")]
-use super::transport::{Sessions, Transport, own_sessions};
 use super::{Client, Outcome, is_local_resource};
 use crate::load::Meter;
 use crate::{BreakReason, Counts, LatencyStats, LoadStats, Setups};
@@ -75,7 +71,7 @@ impl Attempt {
 }
 
 /// The socket of one HTTP/1.1 connection, as the engine reads and writes it.
-pub(super) enum Stream {
+pub(crate) enum Stream {
     Plain(TcpStream),
     #[cfg(feature = "tls")]
     Tls(Box<Secure<TcpStream>>),
@@ -87,7 +83,7 @@ impl Stream {
     /// bytes announce themselves with a new readiness event. Under TLS the
     /// records behind the decrypted bytes are not visible, so only a read
     /// that finds nothing settles it.
-    fn read(
+    pub(crate) fn read(
         &mut self,
         buffer: &mut [u8],
     ) -> io::Result<(usize, bool)> {
@@ -101,7 +97,7 @@ impl Stream {
         }
     }
 
-    fn write(
+    pub(crate) fn write(
         &mut self,
         bytes: &[u8],
     ) -> io::Result<usize> {
@@ -112,7 +108,23 @@ impl Stream {
         }
     }
 
-    pub(super) fn socket(&mut self) -> &mut TcpStream {
+    #[cfg(feature = "http2")]
+    pub(crate) fn finish(
+        &mut self,
+        writable: &mut bool,
+    ) -> io::Result<bool> {
+        match self {
+            Self::Plain(stream) => {
+                let _ = writable;
+                stream.shutdown(std::net::Shutdown::Write)?;
+                Ok(true)
+            }
+            #[cfg(feature = "tls")]
+            Self::Tls(secure) => secure.close_step(writable),
+        }
+    }
+
+    pub(crate) fn socket(&mut self) -> &mut TcpStream {
         match self {
             Self::Plain(stream) => stream,
             #[cfg(feature = "tls")]
@@ -120,7 +132,7 @@ impl Stream {
         }
     }
 
-    pub(super) fn negotiated(&self) -> Option<crate::Negotiated> {
+    pub(crate) fn negotiated(&self) -> Option<crate::Negotiated> {
         match self {
             Self::Plain(_) => None,
             #[cfg(feature = "tls")]
@@ -128,7 +140,7 @@ impl Stream {
         }
     }
 
-    pub(super) fn resumed(&self) -> bool {
+    pub(crate) fn resumed(&self) -> bool {
         match self {
             Self::Plain(_) => false,
             #[cfg(feature = "tls")]
@@ -141,7 +153,7 @@ impl Stream {
 /// sets a side; a read that finds nothing or a write that finds no room
 /// clears it. Nothing is asked of the kernel in between.
 #[derive(Clone, Copy, Default)]
-pub(super) struct Flags {
+pub(crate) struct Flags {
     pub readable: bool,
     pub writable: bool,
     /// The peer ended its side, or the socket failed. No further event will
@@ -150,7 +162,7 @@ pub(super) struct Flags {
 }
 
 /// What one turn of a connection works with.
-pub(super) struct Turn<'a> {
+pub(crate) struct Turn<'a> {
     pub client: &'a Client,
     pub window: Window,
     /// The run or the phase was stopped: nothing new is admitted.
@@ -162,7 +174,7 @@ pub(super) struct Turn<'a> {
     pub owner: usize,
 }
 
-pub(super) enum Step {
+pub(crate) enum Step {
     /// Nothing more until the socket or a deadline says so.
     Wait,
     /// The socket may hold more; the other owners go first.
@@ -181,13 +193,13 @@ pub(crate) struct Conn {
     /// Requests this connection may still admit, in the connection test.
     remaining: Option<usize>,
     /// The peer answered the closing request and announced its close.
-    pub(super) peer_closing: bool,
+    pub(crate) peer_closing: bool,
 }
 
 impl Conn {
     /// `deadline` is the setup's own. Where setup is not measured apart, the
     /// first request answers within it.
-    pub(super) fn new(
+    pub(crate) fn new(
         stream: Stream,
         client: &Client,
         window: Window,
@@ -213,7 +225,7 @@ impl Conn {
         })
     }
 
-    pub(super) fn stream(&self) -> &Stream {
+    pub(crate) fn stream(&self) -> &Stream {
         &self.stream
     }
 
@@ -222,12 +234,12 @@ impl Conn {
         self.writing.map_or(0, |writing| writing.unsent())
     }
 
-    pub(super) fn socket(&mut self) -> &mut TcpStream {
+    pub(crate) fn socket(&mut self) -> &mut TcpStream {
         self.stream.socket()
     }
 
     /// Room for a phase's requests, before any of them is admitted.
-    pub(super) fn reserve(
+    pub(crate) fn reserve(
         &mut self,
         window: Window,
     ) -> Result<(), BreakReason> {
@@ -237,13 +249,13 @@ impl Conn {
     }
 
     /// The deadline this connection is waiting on, if it has one.
-    pub(super) fn deadline(&self) -> Option<Instant> {
+    pub(crate) fn deadline(&self) -> Option<Instant> {
         self.pending.front().map(|attempt| attempt.deadline)
     }
 
     /// Whether the peer has ended the connection it said it would close.
     /// Reading to the end leaves the closing wait state with the peer.
-    pub(super) fn peer_closed(
+    pub(crate) fn peer_closed(
         &mut self,
         flags: &mut Flags,
     ) -> bool {
@@ -323,7 +335,7 @@ impl Conn {
     /// Everything this connection can do now: what was due, one read, and
     /// the requests its free slots admit. It never waits; it says what it
     /// needs next.
-    pub(super) fn exchange(
+    pub(crate) fn exchange(
         &mut self,
         turn: &mut Turn<'_>,
         flags: &mut Flags,
@@ -585,66 +597,6 @@ pub(crate) enum End {
     Failed(BreakReason),
 }
 
-/// One connection of a protocol that is driven through polls, as its owner
-/// drives it. HTTP/1.1 has an engine of its own; this is HTTP/2's.
-/// The owner's loop, its setup accounting and its phase rules are the same
-/// for every protocol; only what happens on the connection differs.
-#[cfg(feature = "http2")]
-pub(crate) trait Carrier: Sized {
-    async fn connect(
-        client: &Client,
-        window: Window,
-        stop: &CancellationToken,
-        sessions: Option<&Sessions>,
-    ) -> Result<Self, BreakReason>;
-
-    async fn exchange(
-        &mut self,
-        client: &Client,
-        window: Window,
-        stop: &CancellationToken,
-        phase_stop: &CancellationToken,
-        summary: &mut Summary,
-        meter: &mut Meter,
-    ) -> End;
-
-    fn negotiated(&self) -> Option<crate::Negotiated>;
-
-    fn resumed(&self) -> bool;
-
-    /// Let a connection that reached the end of its declared lifetime end.
-    async fn retire(
-        self,
-        window: Window,
-    );
-}
-
-/// Establish the transport of one connection within the setup deadline: the
-/// TCP stream and, for an `https://` target, its TLS handshake.
-#[cfg(feature = "http2")]
-pub(crate) async fn open(
-    client: &Client,
-    window: Window,
-    stop: &CancellationToken,
-    sessions: Option<&Sessions>,
-) -> Result<(Transport, Instant), BreakReason> {
-    let deadline = Instant::now() + window.timeout;
-    let stream = tokio::select! {
-        _ = stop.cancelled() => return Err(BreakReason::Cancelled),
-        result = tokio::time::timeout_at(deadline.into(), async {
-            let stream =
-                tokio::net::TcpStream::connect(client.addresses.as_ref())
-                    .await?;
-            stream.set_nodelay(true)?;
-            // An `https://` target is connected once its handshake is done.
-            Transport::open(stream, client, sessions).await
-        }) => {
-            result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection deadline exceeded"))??
-        }
-    };
-    Ok((stream, deadline))
-}
-
 fn io_outcome(error: &io::Error) -> Outcome {
     if is_local_resource(error) {
         Outcome::Abandoned
@@ -671,123 +623,6 @@ fn retire_attempts(
         };
         outcome.record(counts);
     }
-}
-
-/// One persistent owner per declared connection, not one task per request.
-#[cfg(feature = "http2")]
-pub(crate) async fn run_owner<C: Carrier>(
-    client: &Client,
-    mut connection: Option<C>,
-    window: Window,
-    stop: &CancellationToken,
-    phase_stop: &CancellationToken,
-    loaded: &std::sync::Arc<crate::load::Loaded>,
-) -> (Option<C>, Summary) {
-    let mut summary = Summary::default();
-    let mut meter = Meter::new(
-        window.start,
-        window.duration,
-        window.per_connection,
-        Some(loaded.clone()),
-    );
-    // In the connection test an owner is one visitor: it remembers its own
-    // TLS sessions and nobody else's.
-    let churn = window.lifetime.is_some();
-    let sessions = if churn { own_sessions(client) } else { None };
-    loop {
-        if connection.is_none() {
-            if Instant::now() >= window.start + window.duration
-                || stop.is_cancelled()
-                || phase_stop.is_cancelled()
-            {
-                break;
-            }
-            let began = Instant::now();
-            let connected =
-                C::connect(client, window, stop, sessions.as_ref()).await;
-            let setup = began.elapsed();
-            meter.stats.connect_attempts += 1;
-            meter.stats.connect_nanos += setup.as_nanos();
-            match connected {
-                Ok(opened) => {
-                    if summary.tls.is_none() {
-                        summary.tls = opened.negotiated();
-                    }
-                    if churn {
-                        let setups = &mut summary.setups;
-                        setups.attempted += 1;
-                        setups.established += 1;
-                        setups.resumed += u64::from(opened.resumed());
-                        setups.established_nanos += setup.as_nanos();
-                        setups.longest = setups.longest.max(setup);
-                    }
-                    connection = Some(opened);
-                }
-                Err(error) => {
-                    if let BreakReason::Io(error) = &error
-                        && !is_local_resource(error)
-                    {
-                        if churn {
-                            // Here a failed setup is the measured outcome,
-                            // and the owner tries again like any visitor.
-                            summary.setups.attempted += 1;
-                            if error.kind() == io::ErrorKind::TimedOut {
-                                summary.setups.timeout += 1;
-                            } else {
-                                summary.setups.failed += 1;
-                            }
-                            continue;
-                        }
-                        if error.kind() == io::ErrorKind::TimedOut {
-                            Outcome::ConnectTimeout
-                        } else {
-                            Outcome::Connect
-                        }
-                        .record(&mut summary.counts);
-                    }
-                    phase_stop.cancel();
-                    summary.failure = Some(error);
-                    break;
-                }
-            }
-        }
-        match connection
-            .as_mut()
-            .unwrap()
-            .exchange(
-                client,
-                window,
-                stop,
-                phase_stop,
-                &mut summary,
-                &mut meter,
-            )
-            .await
-        {
-            End::Retain => break,
-            End::Reconnect => {
-                if let Some(ended) = connection.take()
-                    && churn
-                {
-                    ended.retire(window).await;
-                }
-            }
-            End::Failed(error) => {
-                phase_stop.cancel();
-                summary.failure = Some(error);
-                connection = None;
-                break;
-            }
-        }
-    }
-    if let Some(connection) = &connection
-        && summary.tls.is_none()
-    {
-        summary.tls = connection.negotiated();
-    }
-    summary.load = meter.finish(Instant::now());
-    summary.at_target = summary.load.latest_first_target.is_some();
-    (connection, summary)
 }
 
 #[cfg(test)]

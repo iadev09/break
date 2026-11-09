@@ -25,22 +25,25 @@
 - `src/worker.rs`: one thread for every CPU the process may run on, or the
   declared number, capped by the fixed connection count. Each owns its
   connections and phase-local counters. Channels carry phase commands/results,
-  not individual requests. An HTTP/1.1 worker runs the engine below; an HTTP/2
-  worker runs a current-thread Tokio executor, because that framing is driven
-  through polls. That executor's one task runs outside Tokio's cooperative
-  budget: the budget is per task, and shared by a thread's connections it
-  starved the ones not answered first.
+  not individual requests. Both protocols run on the Mio engine below, selected
+  by concrete connection type. HTTP/2 has no worker runtime or per-request
+  async block in brk; its session retains the protocol library's response/body
+  handles and polls them internally without an executor.
 - `src/http1.rs`: target validation, cold address resolution and reusable GET
   or fixed-body POST bytes. Echo validation shares the sent buffer.
   Transport-specific preparation remains behind the root API.
-- `src/http1/engine.rs`: the HTTP/1.1 readiness loop of a worker thread. It
+- `src/http1/engine.rs`: the shared readiness loop of a worker thread. It
   asks the kernel which sockets changed, remembers each socket's readable and
-  writable side until a read finds nothing or a write finds no room, and turns
+  writable side until a plain read is short (or a TLS read would block), or a
+  write finds no room, and turns
   the owners that have work in the order the work arrived. There is no task,
-  waker or timer per connection or request, and nothing shared between threads
-  on the request path. Deadlines wait in one queue per thread; every request
+  async task or runtime timer per connection or request. HTTP/2 retains a
+  connection-local progress waker and the protocol library's synchronized stream
+  store; HTTP/1.1 does not acquire either. Deadlines wait in one queue per thread; every request
   has the same budget, so the order they were set in is the order they fall
-  due. The coordinator's channel, start signal and cancellation tokens are
+  due. Entries no longer owned by live work are discarded before selecting the
+  next poll timeout; completed requests cannot wake the poller at old deadlines.
+  The coordinator's channel, start signal and cancellation tokens are
   waited on with a waker that interrupts the loop, and what the tokens say is
   read once per interruption. An owner establishes its connection (TCP, then
   TLS), drives it, replaces it when it ends and accounts for each.
@@ -56,26 +59,35 @@
   enter the load integral; complete responses or retirement leave it. Expired
   attempts, direct transport failures and unexpired abandoned followers remain
   distinct failed outcomes. TCP setup failures are counted separately. The
-  owner loop for protocols driven through polls lives here too.
+  connection contract is instantiated statically by the shared engine.
 - `src/http1/transport.rs`: what carries a connection's bytes. A TCP stream, or
   the same stream under TLS for an `https://` target (`tls` feature). Both expose
   non-blocking reads and writes, so the connection loop does not know which it
-  drives. The TLS session is one type over the engine's sockets and Tokio's,
-  and is driven directly on their readiness:
+  drives. The TLS session is driven directly on socket readiness:
   records already owed are written before new request bytes are accepted, and
   decrypted bytes still held by the session are reported readable without
   waiting for the socket. The handshake completes inside connection setup.
   The target may declare the version, key exchange group and cipher suite it
   offers; what a connection negotiated is reported with each phase.
-- `src/http2.rs`: the same owner loop over HTTP/2 (`http2` feature). One
-  future per connection polls the connection's driver, opens streams while the
-  level and the peer's limit allow, and collects each stream's outcome. A
-  stream has its own deadline; missing it drops and resets that stream alone.
-  Setup ends when the peer's settings have arrived. Each POST stream queues
-  one shared body buffer; h2 frames it under the peer's flow-control windows.
-  There is no separate body-capacity waiter competing with request readiness
-  for a pending stream's send-side waker. The framing drives the transport
-  through polls, which the TCP stream and the TLS session answer.
+- `src/http2.rs`: a concrete connection for the same readiness engine, using
+  the buffer-driven `h2::client::sans_io::Session`. It drains typed response
+  events and keeps request state and FIFO deadline identifiers in reusable
+  connection-owned storage. Responses may complete out of order. An expired
+  request resets only its own stream; there is no per-stream Tokio timer,
+  async block or `FuturesUnordered` node. Setup includes peer SETTINGS. POST
+  queues one shared body buffer under the peer's wire flow control. Peer stream
+  limits and byte windows remain separate. The Sans-I/O core shares framing,
+  HPACK and protocol validation with the existing async H2 API. Its synchronized
+  stream store and header allocations remain; their removal is a separate task.
+  Socket readiness and request batching are separate: a bounded queue holds
+  request intent for one local work-queue turn, before creating protocol streams.
+  Expired intent is removed before HEADERS can be encoded. Submission retains
+  the original admission deadline; blocked writes do not restart its budget.
+  Protocol events are drained after output progress as well as after input, so
+  buffered work does not depend on a fresh socket edge. No timed pacing is added.
+  Input currently crosses a reusable socket scratch buffer before entering the
+  frame decoder. HTTP/2 admission counts submission to the protocol, matching
+  the previous implementation; it is not a count of bytes accepted by the kernel.
 - `src/http1/decode.rs`: incremental response framing with httparse. Handles
   interim responses, Content-Length, chunked/trailers, close-delimited bodies and
   coalesced/fragmented replies. Payload bytes are checked in place. Ambiguous or

@@ -1,8 +1,8 @@
-//! The HTTP/1.1 engine: one readiness loop on each worker thread, with every
+//! The protocol engine: one readiness loop on each worker thread, with every
 //! connection a plain state in it.
 //!
-//! Nothing exists per request or per connection but that state: no task, no
-//! waker, no timer and nothing shared between threads. The loop asks the
+//! No async task or runtime timer is created for a connection or request.
+//! HTTP/2 retains its protocol store and one local progress waker. The loop asks the
 //! kernel which sockets changed, remembers it, and turns each owner that has
 //! work in the order the work arrived. Deadlines wait in one queue per
 //! thread; every request has the same budget, so the order they were set in
@@ -24,9 +24,7 @@ use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::connection::{
-    Conn, End, Flags, Step, Stream, Summary, Turn, Window,
-};
+use super::connection::{End, Flags, Step, Stream, Summary, Turn, Window};
 #[cfg(feature = "tls")]
 use super::transport::secure::Secure;
 use super::transport::{Sessions, own_sessions};
@@ -69,21 +67,21 @@ enum Stage {
 }
 
 #[derive(Default)]
-enum State {
+enum State<C> {
     /// No connection: the next turn establishes one, or ends the phase.
     #[default]
     Idle,
     Setup(Setup),
-    Open(Conn),
+    Handshake(C, Instant, Instant),
+    Open(C),
     /// The peer said it closes; the owner reads until it has.
-    Retiring(Conn, Instant),
+    Retiring(C, Instant),
 }
 
 /// One declared connection of a phase: it holds a connection, replaces it
 /// when it ends, and accounts for both.
-#[derive(Default)]
-struct Owner {
-    state: State,
+struct Owner<C> {
+    state: State<C>,
     flags: Flags,
     /// The socket is registered for write readiness. It is only while the
     /// owner believes it full or not yet connected: a socket with room
@@ -126,7 +124,103 @@ struct Phase<'a> {
     failed: bool,
 }
 
-impl Owner {
+impl<C> Default for Owner<C> {
+    fn default() -> Self {
+        Self {
+            state: State::Idle,
+            flags: Flags::default(),
+            armed: false,
+            queued: false,
+            done: false,
+            summary: Summary::default(),
+            meter: None,
+            sessions: None,
+        }
+    }
+}
+
+/// A statically selected wire protocol on the worker's readiness loop.
+pub(crate) trait Protocol: Sized {
+    const HANDSHAKE: bool;
+    fn new(
+        stream: Stream,
+        client: &Client,
+        window: Window,
+        deadline: Instant,
+    ) -> Result<Self, BreakReason>;
+    fn stream(&self) -> &Stream;
+    fn socket(&mut self) -> &mut TcpStream;
+    fn reserve(
+        &mut self,
+        window: Window,
+    ) -> Result<(), BreakReason>;
+    fn deadline(&self) -> Option<Instant>;
+    fn exchange(
+        &mut self,
+        turn: &mut Turn<'_>,
+        flags: &mut Flags,
+        summary: &mut Summary,
+        meter: &mut Meter,
+    ) -> Step;
+    fn peer_closing(&self) -> bool;
+    fn peer_closed(
+        &mut self,
+        flags: &mut Flags,
+    ) -> bool;
+    fn handshake(
+        &mut self,
+        _flags: &mut Flags,
+    ) -> io::Result<bool> {
+        Ok(true)
+    }
+}
+
+impl Protocol for super::connection::Conn {
+    const HANDSHAKE: bool = false;
+    fn new(
+        stream: Stream,
+        client: &Client,
+        window: Window,
+        deadline: Instant,
+    ) -> Result<Self, BreakReason> {
+        Self::new(stream, client, window, deadline)
+    }
+    fn stream(&self) -> &Stream {
+        self.stream()
+    }
+    fn socket(&mut self) -> &mut TcpStream {
+        self.socket()
+    }
+    fn reserve(
+        &mut self,
+        window: Window,
+    ) -> Result<(), BreakReason> {
+        self.reserve(window)
+    }
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline()
+    }
+    fn exchange(
+        &mut self,
+        turn: &mut Turn<'_>,
+        flags: &mut Flags,
+        summary: &mut Summary,
+        meter: &mut Meter,
+    ) -> Step {
+        self.exchange(turn, flags, summary, meter)
+    }
+    fn peer_closing(&self) -> bool {
+        self.peer_closing
+    }
+    fn peer_closed(
+        &mut self,
+        flags: &mut Flags,
+    ) -> bool {
+        self.peer_closed(flags)
+    }
+}
+
+impl<C: Protocol> Owner<C> {
     fn begin(
         &mut self,
         phase: &Phase<'_>,
@@ -149,19 +243,26 @@ impl Owner {
         Ok(())
     }
 
-    /// Whether a deadline this owner waits on has passed.
+    /// The earliest deadline still owned by live work.
+    fn deadline(&self) -> Option<Instant> {
+        if self.done {
+            return None;
+        }
+        match &self.state {
+            State::Idle => None,
+            State::Setup(setup) => Some(setup.deadline),
+            State::Open(connection) => connection.deadline(),
+            State::Retiring(_, deadline) | State::Handshake(_, _, deadline) => {
+                Some(*deadline)
+            }
+        }
+    }
+
     fn due(
         &self,
         now: Instant,
     ) -> bool {
-        match &self.state {
-            State::Idle => false,
-            State::Setup(setup) => setup.deadline <= now,
-            State::Open(connection) => {
-                connection.deadline().is_some_and(|deadline| deadline <= now)
-            }
-            State::Retiring(_, deadline) => *deadline <= now,
-        }
+        self.deadline().is_some_and(|deadline| deadline <= now)
     }
 
     fn finish(
@@ -343,9 +444,9 @@ impl Owner {
                 #[cfg(feature = "tls")]
                 Stage::Securing(secure) => secure.socket(),
             }),
-            State::Open(connection) | State::Retiring(connection, _) => {
-                Some(connection.socket())
-            }
+            State::Open(connection)
+            | State::Retiring(connection, _)
+            | State::Handshake(connection, _, _) => Some(connection.socket()),
         }
     }
 
@@ -382,34 +483,23 @@ impl Owner {
                     match self.open(phase) {
                         Opened::Pending => return Turned::Wait,
                         Opened::Ready(stream) => {
-                            let elapsed = began.elapsed();
-                            let meter = self.meter.as_mut().unwrap();
-                            meter.stats.connect_attempts += 1;
-                            meter.stats.connect_nanos += elapsed.as_nanos();
-                            if self.summary.tls.is_none() {
-                                self.summary.tls = stream.negotiated();
-                            }
-                            if phase.churn {
-                                let setups = &mut self.summary.setups;
-                                setups.attempted += 1;
-                                setups.established += 1;
-                                setups.resumed += u64::from(stream.resumed());
-                                setups.established_nanos += elapsed.as_nanos();
-                                setups.longest = setups.longest.max(elapsed);
-                            }
-                            let opened = Conn::new(
-                                stream,
-                                phase.client,
-                                window,
-                                deadline,
-                            )
-                            .and_then(|mut connection| {
-                                connection.reserve(window)?;
-                                Ok(connection)
-                            });
+                            let opened =
+                                C::new(stream, phase.client, window, deadline)
+                                    .and_then(|mut connection| {
+                                        connection.reserve(window)?;
+                                        Ok(connection)
+                                    });
                             match opened {
                                 Ok(connection) => {
-                                    self.state = State::Open(connection);
+                                    if C::HANDSHAKE {
+                                        self.state = State::Handshake(
+                                            connection, began, deadline,
+                                        );
+                                    } else {
+                                        self.established(
+                                            connection, began, phase,
+                                        );
+                                    }
                                 }
                                 Err(error) => {
                                     phase.failed = true;
@@ -440,6 +530,40 @@ impl Owner {
                         }
                     }
                 }
+                State::Handshake(connection, began, deadline) => {
+                    if phase.cancelled {
+                        self.state = State::Idle;
+                        return self.finish(Some(BreakReason::Cancelled));
+                    }
+                    match connection.handshake(&mut self.flags) {
+                        Ok(true) => {
+                            let began = *began;
+                            let State::Handshake(connection, _, _) =
+                                std::mem::take(&mut self.state)
+                            else {
+                                unreachable!()
+                            };
+                            self.established(connection, began, phase);
+                        }
+                        Ok(false) if *deadline > Instant::now() => {
+                            return Turned::Wait;
+                        }
+                        result => {
+                            let error = result.err().unwrap_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "HTTP handshake deadline exceeded",
+                                )
+                            });
+                            let began = *began;
+                            self.state = State::Idle;
+                            match self.failed(error.into(), began, phase) {
+                                Some(turned) => return turned,
+                                None => return Turned::Again,
+                            }
+                        }
+                    }
+                }
                 State::Open(connection) => {
                     let mut turn = Turn {
                         client: phase.client,
@@ -463,7 +587,7 @@ impl Owner {
                             else {
                                 unreachable!("the connection was matched above")
                             };
-                            if phase.churn && ended.peer_closing {
+                            if phase.churn && ended.peer_closing() {
                                 let deadline = Instant::now() + window.timeout;
                                 timers.push_back((deadline, index));
                                 self.state = State::Retiring(ended, deadline);
@@ -486,6 +610,30 @@ impl Owner {
                 }
             }
         }
+    }
+
+    fn established(
+        &mut self,
+        connection: C,
+        began: Instant,
+        phase: &Phase<'_>,
+    ) {
+        let elapsed = began.elapsed();
+        let meter = self.meter.as_mut().unwrap();
+        meter.stats.connect_attempts += 1;
+        meter.stats.connect_nanos += elapsed.as_nanos();
+        if self.summary.tls.is_none() {
+            self.summary.tls = connection.stream().negotiated();
+        }
+        if phase.churn {
+            let setups = &mut self.summary.setups;
+            setups.attempted += 1;
+            setups.established += 1;
+            setups.resumed += u64::from(connection.stream().resumed());
+            setups.established_nanos += elapsed.as_nanos();
+            setups.longest = setups.longest.max(elapsed);
+        }
+        self.state = State::Open(connection);
     }
 
     /// Account for a setup that did not establish a connection. `None` when
@@ -531,17 +679,17 @@ fn in_progress(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotConnected
 }
 
-struct Engine {
+struct Engine<C> {
     poll: Poll,
     events: Events,
     signal: Arc<Signal>,
-    owners: Vec<Owner>,
+    owners: Vec<Owner<C>>,
     /// Owners with work, in the order it arrived.
     queue: VecDeque<usize>,
     timers: VecDeque<(Instant, usize)>,
 }
 
-impl Engine {
+impl<C: Protocol> Engine<C> {
     fn new(kept: usize) -> io::Result<Self> {
         let poll = Poll::new()?;
         let signal =
@@ -562,7 +710,7 @@ impl Engine {
     }
 
     fn enqueue(
-        owners: &mut [Owner],
+        owners: &mut [Owner<C>],
         queue: &mut VecDeque<usize>,
         index: usize,
     ) {
@@ -740,11 +888,15 @@ impl Engine {
                     Self::enqueue(&mut self.owners, &mut self.queue, index);
                 }
             }
-            while let Some(&(deadline, index)) = self.timers.front() {
+            while let Some(deadline) =
+                next_live_deadline(&mut self.timers, |index| {
+                    self.owners.get(index).and_then(Owner::deadline)
+                })
+            {
                 if deadline > now {
                     break;
                 }
-                self.timers.pop_front();
+                let (_, index) = self.timers.pop_front().expect("live timer");
                 if self.owners.get(index).is_some_and(|owner| owner.due(now)) {
                     Self::enqueue(&mut self.owners, &mut self.queue, index);
                 }
@@ -786,15 +938,30 @@ impl Engine {
     }
 }
 
+/// Completed work must not wake the poller at its former deadline. Keep an
+/// entry conservatively when an owner has work due at or before that entry.
+fn next_live_deadline(
+    timers: &mut VecDeque<(Instant, usize)>,
+    mut live: impl FnMut(usize) -> Option<Instant>,
+) -> Option<Instant> {
+    loop {
+        let &(deadline, index) = timers.front()?;
+        if live(index).is_some_and(|actual| actual <= deadline) {
+            return Some(deadline);
+        }
+        timers.pop_front();
+    }
+}
+
 /// A worker thread's whole life: wait for a phase, run it, report it.
-pub(crate) fn serve(
+pub(crate) fn serve<C: Protocol>(
     client: Client,
     kept: usize,
     mut commands: UnboundedReceiver<Command>,
     stop: CancellationToken,
     ready: std::sync::mpsc::Sender<io::Result<()>>,
 ) {
-    let mut engine = match Engine::new(kept) {
+    let mut engine = match Engine::<C>::new(kept) {
         Ok(engine) => engine,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -832,5 +999,37 @@ pub(crate) fn serve(
             command.loaded.finished();
         }
         let _ = command.reply.send(summary);
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+
+    #[test]
+    fn completed_and_advanced_deadlines_do_not_schedule_a_poll() {
+        let now = Instant::now();
+        let old = now + Duration::from_millis(50);
+        let current = now + Duration::from_millis(100);
+        let mut timers = VecDeque::from([(old, 0), (old, 1), (current, 1)]);
+        let live = [None, Some(current)];
+        assert_eq!(next_live_deadline(&mut timers, |i| live[i]), Some(current));
+        assert_eq!(timers, VecDeque::from([(current, 1)]));
+    }
+
+    #[test]
+    fn live_deadlines_and_their_successors_are_preserved() {
+        let now = Instant::now();
+        let later = now + Duration::from_millis(100);
+        let mut timers = VecDeque::from([(now, 0), (later, 0), (later, 1)]);
+        assert_eq!(next_live_deadline(&mut timers, |_| Some(now)), Some(now));
+        assert_eq!(timers.len(), 3);
+        assert_eq!(
+            next_live_deadline(&mut timers, |_| Some(later)),
+            Some(later)
+        );
+        assert_eq!(timers.len(), 2);
+        assert_eq!(next_live_deadline(&mut timers, |_| None), None);
+        assert!(timers.is_empty());
     }
 }
