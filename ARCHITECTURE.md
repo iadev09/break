@@ -80,7 +80,9 @@
   HPACK and protocol validation with the existing async H2 API. Its synchronized
   stream store and header allocations remain; their removal is a separate task.
   Socket readiness and request batching are separate: a bounded queue holds
-  request intent for one local work-queue turn, before creating protocol streams.
+  partial request intent for one local work-queue turn before creating streams.
+  A complete configured window publishes in the same turn; another turn cannot
+  enlarge that batch. Smaller batches still progress without waiting to fill.
   Expired intent is removed before HEADERS can be encoded. Submission retains
   the original admission deadline; blocked writes do not restart its budget.
   Protocol events are drained after output progress as well as after input, so

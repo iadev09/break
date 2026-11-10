@@ -530,9 +530,14 @@ impl Protocol for Connection {
                 *remaining -= 1;
             }
         }
-        if !emit && !self.queued.is_empty() && flags.writable {
+        if !emit
+            && !self.queued.is_empty()
+            && self.queued.len() < window.per_connection
+            && flags.writable
+        {
             // A local work turn, not a timer: service other ready connections
-            // before constructing and writing this request batch.
+            // before constructing and writing a partial request batch. A full
+            // window cannot grow on another turn, so publish it immediately.
             return Step::Again;
         }
         if let Err(error) = self.publish_queued(turn.client, summary, meter) {
@@ -715,5 +720,104 @@ mod tests {
             vec![1],
             "expired intent must not allocate or publish a stream"
         );
+    }
+
+    #[test]
+    fn a_full_window_publishes_now_but_a_partial_refill_keeps_its_staging_turn()
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer =
+            std::net::TcpStream::connect(listener.local_addr().unwrap())
+                .unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let client = crate::Target::new("http://example.test/")
+            .unwrap()
+            .connect_to(listener.local_addr().unwrap())
+            .http2()
+            .resolve()
+            .unwrap()
+            .client();
+        let began = Instant::now();
+        let window = Window {
+            per_connection: 8,
+            start: began,
+            duration: Duration::from_secs(10),
+            timeout: Duration::from_millis(100),
+            lifetime: None,
+        };
+        let first_deadline = began + window.timeout;
+        let mut connection = Connection::new(
+            Stream::Plain(TcpStream::from_std(socket)),
+            &client,
+            window,
+            first_deadline,
+        )
+        .unwrap();
+        // Empty peer SETTINGS followed by its acknowledgement of ours.
+        connection.session.input().extend_from_slice(&[
+            0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0,
+        ]);
+        let mut timers = VecDeque::new();
+        let mut turn = Turn {
+            client: &client,
+            window,
+            halted: false,
+            timers: &mut timers,
+            owner: 0,
+        };
+        let mut flags = Flags { writable: true, ..Flags::default() };
+        let mut summary = Summary::default();
+        let mut meter =
+            Meter::new(began, window.duration, window.per_connection, None);
+        assert!(matches!(
+            connection.exchange(
+                &mut turn,
+                &mut flags,
+                &mut summary,
+                &mut meter
+            ),
+            Step::Wait
+        ));
+        assert_eq!(summary.counts.sent, 8);
+        assert_eq!(connection.pending.len(), 8);
+        assert!(connection.queued.is_empty());
+        assert_eq!(connection.pending[&1].deadline, first_deadline);
+
+        // Stream 1 answers with :status 200 and END_STREAM. Seven others stay open.
+        connection
+            .session
+            .input()
+            .extend_from_slice(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 0x88]);
+        assert!(matches!(
+            connection.exchange(
+                &mut turn,
+                &mut flags,
+                &mut summary,
+                &mut meter
+            ),
+            Step::Again
+        ));
+        assert_eq!(summary.counts.successful, 1);
+        assert_eq!(summary.counts.sent, 8);
+        assert_eq!(connection.pending.len(), 7);
+        assert_eq!(connection.queued.len(), 1);
+        let queued = connection.queued[0];
+        assert_eq!(queued.deadline, queued.began + window.timeout);
+        assert!(matches!(
+            connection.exchange(
+                &mut turn,
+                &mut flags,
+                &mut summary,
+                &mut meter
+            ),
+            Step::Wait
+        ));
+        assert_eq!(summary.counts.sent, 9);
+        assert_eq!(connection.pending.len(), 8);
+        assert!(connection.queued.is_empty());
+        assert_eq!(connection.pending[&17].deadline, queued.deadline);
+        assert_eq!(connection.pending[&17].began, queued.began);
+        assert_eq!(summary.counts.failed(), 0);
     }
 }
