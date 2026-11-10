@@ -207,6 +207,11 @@ not serve a returning visitor shows up as full handshakes.
 
 ## HTTP/2
 
+HTTP/2 uses the Sans-I/O client from
+[h2-forked](https://crates.io/crates/h2-forked). It shares brk's Mio readiness
+engine with HTTP/1.1: brk owns socket I/O and request deadlines, while the
+protocol library handles framing, HPACK, flow control and stream state.
+
 `--http2` runs either test over HTTP/2. Over `https://` only `h2` is offered
 during the handshake; over `http://` the connection starts with prior
 knowledge. A server that does not speak it fails setup.
@@ -246,9 +251,8 @@ lateness expose generator pressure. They do not independently identify server
 time, network time or client scheduling delay. A worker thread turns its
 connections in the order their work arrives; a write burst ends with the free
 request slots or with a full socket, and reads are served before the next.
-Both protocols use a Mio readiness loop. HTTP/2 uses the buffer-driven client
-from [h2-forked](https://crates.io/crates/h2-forked); request deadlines are stored
-by the worker rather than registered as individual runtime timers.
+Both protocols use a Mio readiness loop. Request deadlines are stored by the
+worker rather than registered as individual runtime timers.
 
 `timeout`, `transport`, `abandoned`, `connect`, `connect-timeout`, `status` and
 `body` are separate failed-attempt categories. Retiring an ordered connection
@@ -280,8 +284,8 @@ report them as unavailable.
 
 ## Known limits
 
-- **HTTP/2 has additional protocol and stream-state costs.** The current
-  development path uses a Sans-I/O H2 session on Mio. It retains HPACK, flow
+- **HTTP/2 has additional protocol and stream-state costs.** The client
+  uses a Sans-I/O H2 session on Mio. It retains HPACK, flow
   control and protocol checks. Header construction and the protocol library's
   stream ownership still cost CPU. The small cleartext-response benchmark on
   macOS currently regresses in CPU per response and throughput against the
@@ -324,7 +328,7 @@ optional exact status and body validation.
 
 ```toml
 [dependencies]
-brk = { package = "break", version = "0.2.1", default-features = false }
+brk = { package = "break", version = "0.2.2", default-features = false }
 ```
 
 Add `features = ["tls", "http2"]` when those transports are needed. CLI parsing

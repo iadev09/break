@@ -1,6 +1,6 @@
 [package]
 name = "break"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 autotests = false
 description = "Find the HTTP load that breaks your SLA"
