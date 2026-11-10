@@ -132,8 +132,9 @@ impl Connection {
         summary: &mut Summary,
         meter: &mut Meter,
     ) -> io::Result<()> {
-        while let Some(event) = self.session.next_event() {
-            match event {
+        let mut event = self.session.next_event();
+        while let Some(next) = event {
+            match next {
                 Event::Informational { .. } => (),
                 Event::Headers { stream, response } => {
                     if let Some(attempt) =
@@ -156,9 +157,13 @@ impl Connection {
                         }
                         attempt.offset += bytes.len();
                     }
-                    self.session
-                        .release_capacity(stream, bytes.len())
+                    // The bytes have been validated. Return their credit and
+                    // advance the same receive cursor in one store operation.
+                    event = self
+                        .session
+                        .release_capacity_and_next_event(stream, bytes.len())
                         .map_err(io_error)?;
+                    continue;
                 }
                 Event::End { stream, .. } => {
                     if let Some(attempt) = self.pending.remove(&stream.as_u32())
@@ -198,6 +203,7 @@ impl Connection {
                     }
                 }
             }
+            event = self.session.next_event();
         }
         self.trim_deadlines();
         Ok(())
