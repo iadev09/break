@@ -1,6 +1,6 @@
 [package]
 name = "break"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 default-run = "brk"
 autotests = false
@@ -72,7 +72,7 @@ http = "1"
 httparse = "1"
 
 # Optional HTTP/2 framing
-h2 = { package = "h2-forked", version = "0.4.21", features = ["sans-io"], optional = true }
+h2 = { package = "h2-forked", version = "0.4.22", features = ["sans-io"], optional = true }
 
 # Optional TLS transport
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }

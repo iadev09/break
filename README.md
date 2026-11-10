@@ -329,7 +329,7 @@ optional exact status and body validation.
 
 ```toml
 [dependencies]
-brk = { package = "break", version = "0.2.2", default-features = false }
+brk = { package = "break", version = "0.2.3", default-features = false }
 ```
 
 Add `features = ["tls", "http2"]` when those transports are needed. CLI parsing
