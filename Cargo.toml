@@ -2,6 +2,7 @@
 name = "break"
 version = "0.2.2"
 edition = "2024"
+default-run = "brk"
 autotests = false
 description = "Find the HTTP load that breaks your SLA"
 repository = "https://github.com/iadev09/break"
@@ -33,16 +34,26 @@ name = "http2"
 path = "tests/http2.rs"
 required-features = ["http2", "tls"]
 
+[[test]]
+name = "fixture"
+path = "tests/fixture.rs"
+required-features = ["fixture", "http2"]
+
 [[bin]]
 name = "brk"
 path = "src/bin/brk.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "brk-fixture"
+path = "src/bin/brk-fixture.rs"
+required-features = ["fixture"]
+
 [[bench]]
 name = "client"
 path = "benches/client.rs"
 harness = false
-required-features = ["cli", "http2"]
+required-features = ["cli", "http2", "fixture"]
 
 [features]
 default = ["cli", "tls", "http2"]
@@ -51,6 +62,8 @@ cli = ["dep:clap", "dep:ctrlc", "dep:humantime"]
 tls = ["dep:rustls", "dep:rustls-native-certs"]
 # `--http2`: the same tests over HTTP/2 streams.
 http2 = ["dep:h2", "dep:fnv"]
+# Optional child-process benchmark responder and reusable control contract.
+fixture = ["tls", "dep:hyper", "dep:hyper-util", "dep:http-body", "dep:http-body-util", "dep:tokio-rustls", "dep:rcgen", "dep:serde", "dep:serde_json", "tokio/rt-multi-thread"]
 
 [dependencies]
 # HTTP/1 transport
@@ -78,6 +91,16 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"], optional = true }
 ctrlc = { version = "3", optional = true }
 humantime = { version = "2", optional = true }
+
+# Optional benchmark fixture; absent from the default client build.
+hyper = { version = "1", features = ["http1", "http2", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+http-body = { version = "1", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
+rcgen = { version = "0.14", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

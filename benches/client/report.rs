@@ -5,8 +5,8 @@ use brk::{CancellationToken, Observer, Phase, PhaseStats, Plan, Target};
 
 use super::Result;
 use super::config::{Args, Protocol};
-use super::cpu::Cpu;
-use super::fixture::Fixture;
+use super::fixture;
+use brk::fixture::{Cpu, Process};
 
 #[derive(Default)]
 struct Window {
@@ -16,7 +16,7 @@ struct Window {
 }
 
 struct Measure<'a> {
-    fixture: Option<&'a mut Fixture>,
+    fixture: Option<&'a mut Process>,
     stop: CancellationToken,
     client_start: Option<Cpu>,
     server_start: Option<Cpu>,
@@ -94,6 +94,7 @@ struct Row {
     threads: usize,
     accepted: bool,
     reason: String,
+    responder: String,
 }
 
 fn measure(
@@ -103,15 +104,26 @@ fn measure(
     let mut fixture = args
         .url
         .is_none()
-        .then(|| Fixture::start(args, case.protocol))
+        .then(|| fixture::start(args, case.protocol))
         .transpose()?;
-    let url = args.url.clone().unwrap_or_else(|| {
-        format!("http://{}/plain", fixture.as_ref().unwrap().address)
-    });
+    let url = args
+        .url
+        .clone()
+        .unwrap_or_else(|| fixture.as_ref().unwrap().ready().url());
     let mut target = Target::new(&url)?.expect_body("ok");
-    if case.protocol == Protocol::H2 {
+    if case.protocol != Protocol::H1 {
         target = target.http2();
     }
+    if let Some(trust) = fixture
+        .as_ref()
+        .and_then(|fixture| fixture.ready().trust_pem.as_deref())
+    {
+        target = target.trust_pem(trust.as_bytes())?;
+    }
+    let responder = fixture
+        .as_ref()
+        .map(|fixture| fixture.ready().implementation.clone())
+        .unwrap_or_else(|| "external".to_owned());
     let stop = CancellationToken::new();
     let mut observer = Measure {
         fixture: fixture.as_mut(),
@@ -158,7 +170,7 @@ fn measure(
     if let Some(fixture) = &mut fixture {
         fixture.stop()?;
     }
-    Ok(Row { stats, window, threads, accepted, reason })
+    Ok(Row { stats, window, threads, accepted, reason, responder })
 }
 
 fn ratio(
@@ -240,8 +252,17 @@ fn write_row(
             .unwrap_or_default(),
         stats.load.max_deadline_lateness.as_secs_f64().to_string(),
         row.accepted.to_string(),
+        row.responder.clone(),
+        (case.protocol == Protocol::H2Tls).to_string(),
     ];
-    writeln!(output, "{}", fields.join(","))
+    let escaped = fields.map(|field| {
+        if field.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", field.replace('"', "\"\""))
+        } else {
+            field
+        }
+    });
+    writeln!(output, "{}", escaped.join(","))
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -256,7 +277,7 @@ pub fn run(args: &Args) -> Result<()> {
     )?;
     writeln!(
         output,
-        "# source={},source_dirty={},accept={},body_bytes=2,tls=false,responder={}",
+        "# source={},source_dirty={},accept={},body_bytes=2,responder={}",
         std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -275,11 +296,17 @@ pub fn run(args: &Args) -> Result<()> {
             .map(|output| !output.stdout.is_empty())
             .unwrap_or(true),
         args.accept,
-        if args.url.is_some() { "external" } else { "round_robin_child" }
+        if args.url.is_some() {
+            "external"
+        } else if args.fixture_bin.is_some() {
+            "custom_child"
+        } else {
+            "native_hyper_child"
+        }
     )?;
     writeln!(
         output,
-        "repeat,protocol,connections,depth,target,requested_threads,actual_threads,server_threads,phase_s,timeout_s,elapsed_s,cpu_window_s,attempts,successful,errors,timeouts,transport_errors,abandoned,status_errors,body_errors,connect_errors,connect_timeouts,successful_rps,mean_outstanding,target_coverage,client_user_s,client_system_s,client_cpu_us_per_attempt,client_cpu_us_per_success,client_cpu_cores,client_thread_utilization,server_user_s,server_system_s,server_cpu_cores,server_thread_utilization,max_deadline_lateness_s,accepted"
+        "repeat,protocol,connections,depth,target,requested_threads,actual_threads,server_threads,phase_s,timeout_s,elapsed_s,cpu_window_s,attempts,successful,errors,timeouts,transport_errors,abandoned,status_errors,body_errors,connect_errors,connect_timeouts,successful_rps,mean_outstanding,target_coverage,client_user_s,client_system_s,client_cpu_us_per_attempt,client_cpu_us_per_success,client_cpu_cores,client_thread_utilization,server_user_s,server_system_s,server_cpu_cores,server_thread_utilization,max_deadline_lateness_s,accepted,responder,tls"
     )?;
     output.flush()?;
     let mut peaks: Vec<(Protocol, f64, usize, usize, usize)> = Vec::new();

@@ -14,6 +14,9 @@ mod worker;
 #[cfg(feature = "cli")]
 pub mod cli;
 
+#[cfg(all(feature = "fixture", unix))]
+pub mod fixture;
+
 pub use acceptance::Acceptance;
 pub use cpu::{MachineCpu, MachineSample};
 pub use http1::Target;

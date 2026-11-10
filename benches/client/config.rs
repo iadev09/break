@@ -5,7 +5,10 @@ use clap::{Parser, ValueEnum};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Protocol {
     H1,
+    #[value(name = "h2c", alias = "h2")]
     H2,
+    /// HTTP/2 over TLS, with fixture certificate verification.
+    H2Tls,
 }
 
 impl Protocol {
@@ -13,6 +16,7 @@ impl Protocol {
         match self {
             Self::H1 => "h1",
             Self::H2 => "h2c",
+            Self::H2Tls => "h2-tls",
         }
     }
 }
@@ -21,7 +25,7 @@ impl Protocol {
 #[command(about = "Measure brk's client CPU and observed throughput")]
 pub struct Args {
     /// Protocols to compare. Their order reverses on alternate repetitions.
-    #[arg(long, value_enum, value_delimiter = ',', default_value = "h1,h2")]
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "h1,h2c")]
     pub protocols: Vec<Protocol>,
     /// Fixed connection counts, tested separately.
     #[arg(long, value_delimiter = ',', required = true)]
@@ -46,17 +50,17 @@ pub struct Args {
     /// Responder threads in a separate child process. Required without --url.
     #[arg(long, required_unless_present = "url", conflicts_with = "url")]
     pub server_threads: Option<usize>,
+    /// Another responder executable implementing brk::fixture's control API.
+    #[arg(long, conflicts_with = "url")]
+    pub fixture_bin: Option<std::path::PathBuf>,
     /// Use an external responder instead of the child fixture. Must return ok.
     /// Select the protocol it serves with --protocols.
     #[arg(long)]
     pub url: Option<String>,
-    /// Internal child role; not part of the public benchmark command.
-    #[arg(long, hide = true)]
-    pub fixture: bool,
 }
 
 impl Args {
-    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate(&self) -> super::Result<()> {
         if self.repeat == 0
             || self.connections.is_empty()
             || self.depths.is_empty()
@@ -87,10 +91,11 @@ impl Args {
         u32::try_from(*self.depths.iter().max().unwrap())?;
         if let Some(url) = &self.url {
             brk::Target::new(url)?;
-            if !url.starts_with("http://") {
-                return Err(
-                    "this bench compares cleartext HTTP/1.1 and H2c".into()
-                );
+            for protocol in &self.protocols {
+                if (protocol == &Protocol::H2Tls) != url.starts_with("https://")
+                {
+                    return Err("external URL scheme must match every selected protocol".into());
+                }
             }
         }
         Ok(())

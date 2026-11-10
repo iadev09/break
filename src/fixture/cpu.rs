@@ -1,16 +1,19 @@
+//! Process-wide CPU, excluding children, sampled outside the request path.
 use std::io;
 
-#[derive(Clone, Copy, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Cpu {
     pub user_ns: u64,
     pub system_ns: u64,
 }
 
 impl Cpu {
-    /// Process-wide CPU: the coordinator and every client worker, no children.
     pub fn read() -> io::Result<Self> {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        // SAFETY: getrusage initializes the provided rusage on success.
+        // SAFETY: getrusage initializes rusage on success.
         if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }
             != 0
         {

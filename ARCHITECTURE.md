@@ -197,11 +197,28 @@ the phase contract.
 
 `benches/client.rs` is a custom executable harness, not a unit test or a change
 to the library's request path. `benches/client/config.rs` declares the matrix
-and timing budgets; `fixture.rs` owns a separate responder process and its
-current-thread runtimes, with a round-robin acceptor assigning each connection
-once; `cpu.rs` reads process-wide user/system counters;
+and timing budgets; `fixture.rs` starts a separate responder through the optional
+`src/fixture` API;
 `report.rs` measures through `Observer` and writes raw CSV rows. Every row uses
-one fixed-depth phase with an exact `ok` response, over H1 or H2c.
+one fixed-depth phase with an exact `ok` response, over H1, H2c or TLS/H2.
+
+The `fixture` feature owns server dependencies. `src/fixture/control.rs` provides
+typed configuration, readiness, CPU samples and acknowledged stop over child
+pipes. It also shuts down on EOF and reaps the exact child on parent errors.
+`cpu.rs` reads process-wide user/system counters. `native.rs` runs a concrete
+Hyper service on a declared-size shared Tokio runtime; H2c and TLS/H2 use the
+same builder with an explicit per-connection stream ceiling. Other Hyper limits
+retain its defaults. The TLS identity is generated before readiness; only its
+public trust certificate crosses the pipe. Client verification remains enabled.
+The native workload consumes the request body, accepts GET `/plain` and returns
+exactly two bytes; wrong paths/methods cannot pass as successful benchmark work.
+
+Downstream responders implement `Responder` and enter `serve` from their own
+executable. `--fixture-bin` selects one without introducing a dependency on its
+server framework. `Server::start` is optional common accept/runtime ownership
+for a concrete connection callback. Neither it nor the control protocol adds a
+per-request wrapper, sampling task or shared request counter. This replaces the
+old raw H1/direct-H2 responder; historical runs need that server distinction.
 
 The caller's CPU window covers setup, traffic and drain but excludes target
 resolution and worker startup. Responder control samples fall just outside

@@ -453,13 +453,14 @@ per-request task, shared counter, allocation or additional clock read is added.
 
 ## Benchmark the client
 
-The custom Cargo bench measures `brk` itself against a fixed `ok` responder in
-another process, over cleartext HTTP/1.1 or HTTP/2 with prior knowledge:
+The custom Cargo bench measures the **client**, using a fixed Native Hyper
+responder in another process. Select `h1`, `h2c` (prior knowledge) or `h2-tls`:
 
 ```sh
 mkdir -p .benchmarks
-cargo bench --bench client -- \
-  --connections 128 --depths 1,8 --threads 1,2 --server-threads 4 \
+cargo bench --bench client --features fixture -- \
+  --protocols h2c,h2-tls \
+  --connections 128 --depths 8 --threads 4 --server-threads 8 \
   --phase 10s --timeout 100ms --repeat 2 > .benchmarks/client.csv
 ```
 
@@ -470,16 +471,37 @@ thread count, coverage, errors and responder CPU. CPU counters use Unix
 `getrusage`: the client window excludes target resolution and worker startup,
 and includes connection setup, traffic and drain. Responder counters bracket
 that window through a control pipe; its CPU is never added to the client's.
-Connections are assigned round-robin to responder workers once at accept;
-requests stay on that worker. The responder's accept/control threads are also
-included in its process CPU.
+The responder uses a shared Tokio runtime with the declared worker count.
+Its control thread is also included in server CPU. Both H2 transports use the
+same handler and stream limit; TLS additionally verifies an ephemeral fixture
+certificate. Every response must be `200` with exactly `ok`. Certificate
+generation and server startup precede measurement; connection handshakes do not.
 
 The best accepted rate is observed throughput, not an isolated client ceiling.
 Check errors, coverage and client/responder CPU together. Aggregate responder
 CPU cannot rule out one saturated responder thread. Repeat with more
 `--server-threads`, or use `--url http://127.0.0.1:8080/plain` instead, to check
 whether the responder limits the run. An external target must return exactly
-`ok`; select its protocol with `--protocols h1` or `--protocols h2`. Its CPU is
-not collected. TLS is outside this bench's comparison.
+`ok`; select its protocol explicitly. Its CPU is not collected, and external
+HTTPS targets use system trust. `h2` remains an alias for `h2c` in this bench.
+
+`fixture` is optional and adds no server dependencies to the default client
+build. The source bench now uses Hyper rather than the earlier raw H1/direct-H2
+responder with round-robin current-thread workers. These are different server
+baselines; their throughput differences do not establish a client improvement.
+
+### Reuse the responder contract
+
+`brk::fixture` provides `Config`, `Process`, `Responder` and `serve`. A child reads
+its configuration from stdin, acknowledges its address and implementation on
+stdout, samples its own CPU on request, and drains on stop or control EOF.
+Diagnostics use stderr. The optional `brk-fixture` executable runs the Native
+Hyper implementation of this protocol.
+
+A downstream fixture can call `serve(start)` with its own `Responder`, including
+a Claviron Other handler. Select that executable with `--fixture-bin PATH`;
+the same client matrix and measurement code are retained. `Server::start`
+optionally supplies loopback acceptance and executor ownership for a custom
+connection driver. No request dispatch or client logic depends on this API.
 
 Licensed under MIT OR Apache-2.0.
